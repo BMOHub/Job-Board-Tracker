@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: employers
+    // Fields:
+    //   - name: string (required)
+    //   - category: string (required)
+    //   - website: string (optional)
+    //   - lastScanned: timestamp (optional)
+    //
+    // Collection: jobPostings
+    // Fields:
+    //   - employerId: string (required)
+    //   - employerName: string (required)
+    //   - title: string (required)
+    //   - location: string (optional)
+    //   - url: string (required)
+    //   - postedDate: timestamp (optional)
+    //   - foundDate: timestamp (required)
+    //   - description: string (optional)
+    //
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && 
+        (request.auth.token.email == "08anguyen@gmail.com" && request.auth.token.email_verified == true);
+    }
+
+    match /employers/{employerId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    match /jobPostings/{jobId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+  }
+}

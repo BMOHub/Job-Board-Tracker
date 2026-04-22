@@ -1,0 +1,48 @@
+{
+  "entities": {
+    "Employer": {
+      "title": "Employer",
+      "description": "An employer partner in the Greater Philadelphia region with collaboration details for employment specialists.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The name of the employer." },
+        "category": { "type": "string", "description": "The industry category (e.g., Education, Financial)." },
+        "website": { "type": "string", "description": "The main website or careers page URL." },
+        "contactPerson": { "type": "string", "description": "Primary contact for workforce partners." },
+        "contactEmail": { "type": "string", "description": "Contact email for referrals or inquiries." },
+        "contactPhone": { "type": "string", "description": "Contact phone number." },
+        "specialistNotes": { "type": "string", "description": "Shared internal notes for job coaches and employment specialists." },
+        "lastScanned": { "type": "string", "format": "date-time", "description": "The last time this employer was scanned for jobs." }
+      },
+      "required": ["name", "category"]
+    },
+    "JobPosting": {
+      "title": "Job Posting",
+      "description": "A job opening found for an employer partner.",
+      "type": "object",
+      "properties": {
+        "employerId": { "type": "string", "description": "The ID of the employer." },
+        "employerName": { "type": "string", "description": "The name of the employer." },
+        "title": { "type": "string", "description": "The job title." },
+        "location": { "type": "string", "description": "The full location string." },
+        "city": { "type": "string", "description": "The specific city." },
+        "roleType": { "type": "string", "description": "Full-time, Part-time, etc." },
+        "url": { "type": "string", "description": "The direct link to the job posting." },
+        "postedDate": { "type": "string", "format": "date-time", "description": "The date the job was posted." },
+        "foundDate": { "type": "string", "format": "date-time", "description": "The date the job was discovered by the app." },
+        "description": { "type": "string", "description": "A brief description or snippet of the job." }
+      },
+      "required": ["employerId", "title", "url", "foundDate"]
+    }
+  },
+  "firestore": {
+    "/employers/{employerId}": {
+      "schema": "Employer",
+      "description": "Collection of employer partners."
+    },
+    "/jobPostings/{jobId}": {
+      "schema": "JobPosting",
+      "description": "Collection of job postings found."
+    }
+  }
+}
