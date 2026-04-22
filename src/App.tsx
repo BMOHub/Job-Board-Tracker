@@ -107,8 +107,7 @@ export default function App() {
 
   // Data Listeners
   useEffect(() => {
-    if (!user) return;
-
+    // Public access mode - listeners start immediately
     const qEmployers = query(collection(db, 'employers'), orderBy('name'));
     const unsubscribeEmployers = onSnapshot(qEmployers, (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Employer));
@@ -413,49 +412,7 @@ export default function App() {
     );
   }
 
-  if (!user) {
-    return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center border border-slate-100"
-        >
-          <div className="w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-6">
-            <Briefcase className="w-10 h-10 text-blue-600" />
-          </div>
-          <h1 className="text-3xl font-bold text-slate-900 mb-2">Philly Job Tracker</h1>
-          <p className="text-slate-600 mb-8">
-            Automatically track job postings from workforce development partners in the Greater Philadelphia region.
-          </p>
-          
-          {authError && (
-            <div className="mb-6 p-4 bg-red-50 border border-red-100 rounded-xl flex items-center gap-3 text-red-600 text-sm font-medium">
-              <AlertCircle className="w-5 h-5 flex-shrink-0" />
-              {authError}
-            </div>
-          )}
-
-          <button
-            onClick={handleLogin}
-            disabled={isLoggingIn}
-            className={`w-full flex items-center justify-center gap-3 font-semibold py-4 px-6 rounded-xl transition-all shadow-lg hover:shadow-xl ${
-              isLoggingIn 
-                ? 'bg-slate-100 text-slate-400 cursor-not-allowed' 
-                : 'bg-slate-900 hover:bg-slate-800 text-white'
-            }`}
-          >
-            {isLoggingIn ? (
-              <RefreshCw className="w-5 h-5 animate-spin" />
-            ) : (
-              <LogIn className="w-5 h-5" />
-            )}
-            {isLoggingIn ? 'Opening Login Window...' : 'Sign in with Google'}
-          </button>
-        </motion.div>
-      </div>
-    );
-  }
+  // Remove login gate - the app is now public
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -498,20 +455,32 @@ export default function App() {
               </nav>
 
               <div className="hidden md:flex items-center gap-3 mr-4">
-                <img 
-                  src={user.photoURL || ''} 
-                  alt={user.displayName || ''} 
-                  className="w-8 h-8 rounded-full border border-slate-200"
-                />
-                <span className="text-sm font-medium text-slate-700">{user.displayName}</span>
+                {user ? (
+                  <>
+                    <img 
+                      src={user.photoURL || ''} 
+                      alt={user.displayName || ''} 
+                      className="w-8 h-8 rounded-full border border-slate-200"
+                    />
+                    <span className="text-sm font-medium text-slate-700">{user.displayName}</span>
+                    <button
+                      onClick={() => signOut(auth)}
+                      className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      title="Logout"
+                    >
+                      <LogOut className="w-5 h-5" />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={handleLogin}
+                    className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-blue-600 text-slate-600 hover:text-white font-bold text-sm rounded-lg transition-all"
+                  >
+                    <LogIn className="w-4 h-4" />
+                    Staff Login
+                  </button>
+                )}
               </div>
-              <button
-                onClick={() => signOut(auth)}
-                className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                title="Logout"
-              >
-                <LogOut className="w-5 h-5" />
-              </button>
             </div>
           </div>
         </div>
