@@ -90,6 +90,7 @@ export default function App() {
   const [isScanning, setIsScanning] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [fatalError, setFatalError] = useState<string | null>(null);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showEmployerModal, setShowEmployerModal] = useState(false);
   const [editingEmployer, setEditingEmployer] = useState<Employer | null>(null);
@@ -117,13 +118,19 @@ export default function App() {
       if (data.length === 0) {
         seedEmployers();
       }
-    }, (error) => handleFirestoreError(error, OperationType.LIST, 'employers'));
+    }, (error) => {
+      console.error("Firestore Listeners Failed:", error);
+      setFatalError(error.message || "Failed to connect to database. Check your internet or configuration.");
+    });
 
     const qJobs = query(collection(db, 'jobPostings'), orderBy('foundDate', 'desc'), limit(200));
     const unsubscribeJobs = onSnapshot(qJobs, (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as JobPosting));
       setJobs(data);
-    }, (error) => handleFirestoreError(error, OperationType.LIST, 'jobPostings'));
+    }, (error) => {
+      console.error("Jobs Listener Failed:", error);
+      // Don't necessarily make it fatal if employers work
+    });
 
     return () => {
       unsubscribeEmployers();
@@ -361,10 +368,13 @@ export default function App() {
     });
 
     return result.sort((a, b) => {
-      if (sortBy === 'newest') return b.foundDate?.toMillis() - a.foundDate?.toMillis();
-      if (sortBy === 'oldest') return a.foundDate?.toMillis() - b.foundDate?.toMillis();
-      if (sortBy === 'employer') return a.employerName.localeCompare(b.employerName);
-      if (sortBy === 'title') return a.title.localeCompare(b.title);
+      const timeA = a.foundDate?.toMillis?.() || a.foundDate?.getTime?.() || 0;
+      const timeB = b.foundDate?.toMillis?.() || b.foundDate?.getTime?.() || 0;
+
+      if (sortBy === 'newest') return timeB - timeA;
+      if (sortBy === 'oldest') return timeA - timeB;
+      if (sortBy === 'employer') return (a.employerName || '').localeCompare(b.employerName || '');
+      if (sortBy === 'title') return (a.title || '').localeCompare(b.title || '');
       return 0;
     });
   }, [jobs, searchTerm, selectedCategory, selectedRoleType, selectedCity, sortBy, employers]);
@@ -407,6 +417,31 @@ export default function App() {
         <div className="flex flex-col items-center gap-4">
           <RefreshCw className="w-12 h-12 text-blue-600 animate-spin" />
           <p className="text-slate-600 font-medium">Loading Philly Job Tracker...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (fatalError) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center border border-red-100">
+          <div className="w-16 h-16 bg-red-50 rounded-full flex items-center justify-center mx-auto mb-4">
+            <AlertCircle className="w-8 h-8 text-red-600" />
+          </div>
+          <h2 className="text-xl font-bold text-slate-900 mb-2">Connection Error</h2>
+          <p className="text-slate-600 mb-6 text-sm">
+            {fatalError}
+          </p>
+          <button 
+            onClick={() => window.location.reload()}
+            className="w-full py-3 bg-slate-900 text-white rounded-xl font-bold hover:bg-slate-800 transition-all"
+          >
+            Retry Connection
+          </button>
+          <p className="mt-4 text-xs text-slate-400">
+            If this persists, please check if Firestore rules are deployed and your configuration is correct.
+          </p>
         </div>
       </div>
     );

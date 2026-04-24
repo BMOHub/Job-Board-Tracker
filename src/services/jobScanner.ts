@@ -1,6 +1,16 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+const getApiKey = () => {
+  try {
+    return (typeof process !== 'undefined' && (process as any).env?.GEMINI_API_KEY) || 
+           ((import.meta as any).env?.VITE_GEMINI_API_KEY) || 
+           "";
+  } catch {
+    return "";
+  }
+};
+
+const ai = new GoogleGenAI({ apiKey: getApiKey() });
 
 export interface ScannedJob {
   title: string;
