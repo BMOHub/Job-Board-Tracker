@@ -2,9 +2,17 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 const getApiKey = () => {
   try {
-    return (typeof process !== 'undefined' && (process as any).env?.GEMINI_API_KEY) || 
-           ((import.meta as any).env?.VITE_GEMINI_API_KEY) || 
-           "";
+    // Check VITE_ prefix first (standard for Vite client-side)
+    const vKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+    if (vKey) return vKey;
+
+    // Fallback to process.env (common for AI Studio or defined via vite.config.ts)
+    // Note: Vite's define replaces literal string process.env.GEMINI_API_KEY
+    const pKey = typeof process !== 'undefined' ? (process as any).env?.GEMINI_API_KEY : undefined;
+    if (pKey) return pKey;
+    
+    // Some build systems inject it directly into a global
+    return (window as any).GEMINI_API_KEY || "";
   } catch {
     return "";
   }
