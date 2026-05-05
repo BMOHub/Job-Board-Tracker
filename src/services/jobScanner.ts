@@ -1,24 +1,49 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
 const getApiKey = () => {
+  let key = "";
+  
+  // 1. Try process.env (Vite 'define' or Node environment)
   try {
-    // Check VITE_ prefix first (standard for Vite client-side)
-    const vKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
-    if (vKey) return vKey;
-
-    // Fallback to process.env (common for AI Studio or defined via vite.config.ts)
-    // Note: Vite's define replaces literal string process.env.GEMINI_API_KEY
-    const pKey = typeof process !== 'undefined' ? (process as any).env?.GEMINI_API_KEY : undefined;
-    if (pKey) return pKey;
-    
-    // Some build systems inject it directly into a global
-    return (window as any).GEMINI_API_KEY || "";
-  } catch {
-    return "";
+    if (typeof process !== 'undefined' && (process as any).env) {
+      key = (process as any).env.GEMINI_API_KEY;
+    }
+  } catch (e) {
+    // Ignore error
   }
+
+  // 2. If not found or placeholder, try import.meta.env (Vite standard)
+  if (!key || key === "MY_GEMINI_API_KEY") {
+    try {
+      key = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+    } catch (e) {
+      // Ignore error
+    }
+  }
+
+  // 3. Last fallback: global window variable (if injected)
+  if (!key || key === "MY_VITE_GEMINI_API_KEY") {
+    try {
+      key = (window as any).GEMINI_API_KEY || "";
+    } catch (e) {
+      // Ignore error
+    }
+  }
+
+  return key || "";
 };
 
-const ai = new GoogleGenAI({ apiKey: getApiKey() });
+let aiInstance: GoogleGenAI | null = null;
+
+const getAI = () => {
+  if (!aiInstance) {
+    const key = getApiKey();
+    if (key) {
+      aiInstance = new GoogleGenAI({ apiKey: key });
+    }
+  }
+  return aiInstance;
+};
 
 export const isGeminiConfigured = () => !!getApiKey();
 
@@ -33,23 +58,26 @@ export interface ScannedJob {
 }
 
 export async function scanJobsForEmployer(employerName: string, website: string): Promise<ScannedJob[]> {
+  const ai = getAI();
+  if (!ai) {
+    throw new Error("Gemini API Key is not configured. Please check your environment variables (GEMINI_API_KEY or VITE_GEMINI_API_KEY).");
+  }
+
   const today = new Date().toISOString().split('T')[0];
-  const prompt = `Today's date is ${today}. Find the latest job postings for "${employerName}" that meet the following criteria:
-  1. LOCATION: Must be in the Greater Philadelphia region (including Philadelphia, Bucks, Chester, Delaware, and Montgomery counties in PA, or Burlington, Camden, and Gloucester counties in NJ).
-  2. RECENCY: Must have been posted within the last 15 days (since ${new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]}).
-  3. LINKS (CRITICAL): Provide the UNIQUE, DIRECT URL to each specific job description page. 
-     - DO NOT provide the same URL for multiple jobs.
-     - DO NOT provide generic career portal search pages (e.g., ending in /jobs or /careers without a specific ID).
-     - The URL MUST lead directly to the full job description for that specific title.
-  4. DATA INTEGRITY: The title and description MUST be specific to the job linked. If you cannot find a direct link for a specific job, do not include it.
-  5. SOURCE: Use the official employer website if possible: ${website}.
+  const prompt = `Find current job openings at ${employerName}.
+  - LOCATION: Greater Philadelphia area (Philly, SE Pennsylvania, or South Jersey).
+  - RECENCY: Focus on jobs posted in the last 2-3 weeks.
+  - LINKS: You MUST provide the specific, direct URL to each individual job posting. Avoid the general careers home page.
+  - WEBSITE FOR REFERENCE: ${website}
   
-  Return a list of jobs with their title, direct URL, specific city, role type (e.g., Full-time, Part-time, Contract, Internship), and approximate posted date in YYYY-MM-DD format. 
-  If no jobs matching these criteria are found, return an empty array.`;
+  Return the results as a JSON array of objects.
+  Each object MUST have: title, url (direct link), location, city, roleType (Full-time, Part-time, Contract, or Internship), postedDate (YYYY-MM-DD), and a brief description.
+  
+  If you find no relevant jobs in the Philadelphia area, return an empty array [].`;
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-3-flash-preview",
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
@@ -74,12 +102,19 @@ export async function scanJobsForEmployer(employerName: string, website: string)
       }
     });
 
-    if (response.text) {
-      return JSON.parse(response.text);
+    if (response && response.text) {
+      try {
+        return JSON.parse(response.text);
+      } catch (parseError) {
+        console.error("Failed to parse Gemini JSON response:", response.text, parseError);
+        return [];
+      }
     }
+    console.warn(`No response text from Gemini for ${employerName}`);
     return [];
-  } catch (error) {
+  } catch (error: any) {
     console.error(`Error scanning jobs for ${employerName}:`, error);
-    return [];
+    // Rethrow to allow the UI to catch and display specific error
+    throw error;
   }
 }

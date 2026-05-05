@@ -276,7 +276,7 @@ export default function App() {
 
       } catch (error: any) {
         console.error(`Error scanning ${employer.name}:`, error);
-        setScanError(`Scan failed for ${employer.name}. This is usually due to an invalid or missing Gemini API Key.`);
+        setScanError(`Scan failed for ${employer.name}: ${error.message || 'Unknown error'}`);
         scanFailed = true;
       }
     }
@@ -337,7 +337,7 @@ export default function App() {
 
     } catch (error: any) {
       console.error(`Error scanning ${employer.name}:`, error);
-      setScanError(`Failed to scan ${employer.name}. Check API key configuration.`);
+      setScanError(`Failed to scan ${employer.name}: ${error.message || 'Unknown error'}`);
     }
 
     setIsScanning(false);
@@ -365,7 +365,7 @@ export default function App() {
 
     let result = jobs.filter(job => {
       // 15-day snapshot enforcement
-      const foundTime = job.foundDate?.toMillis() || 0;
+      const foundTime = job.foundDate?.toMillis?.() || job.foundDate?.getTime?.() || 0;
       if (foundTime < fifteenDaysAgo) return false;
 
       const matchesSearch = job.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
@@ -466,11 +466,11 @@ export default function App() {
       <header className="bg-white border-b border-slate-200 sticky top-0 z-30">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-20">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-200">
+            <div className="flex items-center gap-3" id="app-logo">
+              <div className="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-200" id="logo-icon">
                 <Briefcase className="w-6 h-6 text-white" />
               </div>
-              <div>
+              <div id="logo-text">
                 <h1 className="text-xl font-bold text-slate-900 leading-tight">Philly Job Tracker</h1>
                 <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Workforce Development</p>
               </div>
@@ -479,6 +479,7 @@ export default function App() {
             <div className="flex items-center gap-4">
               <nav className="hidden md:flex items-center bg-slate-100 p-1 rounded-xl mr-4">
                 <button
+                  id="tab-jobs"
                   onClick={() => setActiveTab('jobs')}
                   className={`px-4 py-2 rounded-lg text-sm font-bold transition-all ${
                     activeTab === 'jobs' 
@@ -489,6 +490,7 @@ export default function App() {
                   Jobs
                 </button>
                 <button
+                  id="tab-employers"
                   onClick={() => setActiveTab('employers')}
                   className={`px-4 py-2 rounded-lg text-sm font-bold transition-all ${
                     activeTab === 'employers' 
