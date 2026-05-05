@@ -12,6 +12,8 @@ const getApiKey = () => {
 
 const ai = new GoogleGenAI({ apiKey: getApiKey() });
 
+export const isGeminiConfigured = () => !!getApiKey();
+
 export interface ScannedJob {
   title: string;
   url: string;
@@ -39,7 +41,7 @@ export async function scanJobsForEmployer(employerName: string, website: string)
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: "gemini-1.5-flash",
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],

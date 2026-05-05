@@ -48,7 +48,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { auth, db, handleFirestoreError, OperationType } from './lib/firebase';
 import { INITIAL_EMPLOYERS } from './constants';
-import { scanJobsForEmployer } from './services/jobScanner';
+import { scanJobsForEmployer, isGeminiConfigured } from './services/jobScanner';
 
 interface Employer {
   id: string;
@@ -91,6 +91,7 @@ export default function App() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [fatalError, setFatalError] = useState<string | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showEmployerModal, setShowEmployerModal] = useState(false);
   const [editingEmployer, setEditingEmployer] = useState<Employer | null>(null);
@@ -220,8 +221,11 @@ export default function App() {
   const scanAll = async () => {
     if (isScanning) return;
     setIsScanning(true);
+    setScanError(null);
     abortControllerRef.current = false;
     setScanProgress({ current: 0, total: employers.length, employer: '' });
+
+    let scanFailed = false;
 
     for (let i = 0; i < employers.length; i++) {
       if (abortControllerRef.current) break;
@@ -270,11 +274,16 @@ export default function App() {
           lastScanned: serverTimestamp()
         }, { merge: true });
 
-      } catch (error) {
+      } catch (error: any) {
         console.error(`Error scanning ${employer.name}:`, error);
+        setScanError(`Scan failed for ${employer.name}. This is usually due to an invalid or missing Gemini API Key.`);
+        scanFailed = true;
       }
     }
 
+    if (!scanFailed) {
+      setScanError(null);
+    }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
   };
@@ -282,6 +291,7 @@ export default function App() {
   const scanEmployer = async (employer: Employer) => {
     if (isScanning) return;
     setIsScanning(true);
+    setScanError(null);
     abortControllerRef.current = false;
     setScanProgress({ current: 1, total: 1, employer: employer.name });
 
@@ -325,8 +335,9 @@ export default function App() {
         lastScanned: serverTimestamp()
       }, { merge: true });
 
-    } catch (error) {
+    } catch (error: any) {
       console.error(`Error scanning ${employer.name}:`, error);
+      setScanError(`Failed to scan ${employer.name}. Check API key configuration.`);
     }
 
     setIsScanning(false);
@@ -603,6 +614,31 @@ export default function App() {
               </div>
             </div>
 
+            {!isGeminiConfigured() && (
+              <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-amber-700 text-xs shadow-sm">
+                <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                <div className="flex-1">
+                  <span className="font-bold uppercase tracking-wider block mb-0.5">Configuration Required</span>
+                  AI Scanning requires a Google Gemini API Key. Since you are running this from GitHub, you must set the 
+                  <code className="mx-1 px-1 bg-white rounded border border-amber-200 font-mono">VITE_GEMINI_API_KEY</code> 
+                  environment variable in your build settings (e.g. Vercel, Netlify, or GitHub Actions).
+                </div>
+              </div>
+            )}
+
+            {scanError && (
+              <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl flex items-center gap-3 text-red-700 text-xs shadow-sm">
+                <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                <div className="flex-1">
+                  <span className="font-bold uppercase tracking-wider block mb-0.5">Scan Error</span>
+                  {scanError}
+                </div>
+                <button onClick={() => setScanError(null)} className="p-1 hover:bg-red-100 rounded">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-slate-50">
               <div className="flex items-center gap-2 text-xs font-bold text-slate-400 uppercase tracking-wider mr-2">
                 <Filter className="w-3 h-3" />
@@ -675,6 +711,12 @@ export default function App() {
                     Scanning: {scanProgress.employer}
                   </span>
                   <div className="flex items-center gap-4">
+                    {scanError && (
+                      <span className="text-red-500 text-[10px] font-bold bg-red-50 px-2 py-0.5 rounded border border-red-100 flex items-center gap-1">
+                        <AlertCircle className="w-3 h-3" />
+                        API Error Detected
+                      </span>
+                    )}
                     <span>{scanProgress.current} / {scanProgress.total}</span>
                     <button 
                       onClick={stopScan}
