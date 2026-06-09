@@ -96,6 +96,7 @@ export default function App() {
   const [showEmployerModal, setShowEmployerModal] = useState(false);
   const [editingEmployer, setEditingEmployer] = useState<Employer | null>(null);
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0, employer: '' });
+  const [apiConfigured, setApiConfigured] = useState<boolean>(true);
   const abortControllerRef = useMemo(() => ({ current: false }), []);
 
   // Auth Listener
@@ -105,6 +106,24 @@ export default function App() {
       setLoading(false);
     });
     return () => unsubscribe();
+  }, []);
+
+  // Dynamic API configuration check from backend status
+  useEffect(() => {
+    const checkStatus = async () => {
+      try {
+        const res = await fetch("/api/gemini-status");
+        if (res.ok) {
+          const data = await res.json();
+          setApiConfigured(data.configured);
+        } else {
+          setApiConfigured(isGeminiConfigured());
+        }
+      } catch (e) {
+        setApiConfigured(isGeminiConfigured());
+      }
+    };
+    checkStatus();
   }, []);
 
   // Data Listeners
@@ -616,7 +635,7 @@ export default function App() {
               </div>
             </div>
 
-            {!isGeminiConfigured() && (
+            {!apiConfigured && (
               <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-amber-700 text-xs shadow-sm">
                 <AlertCircle className="w-4 h-4 flex-shrink-0" />
                 <div className="flex-1">

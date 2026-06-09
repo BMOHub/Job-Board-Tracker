@@ -1,5 +1,8 @@
 {
   "name": "Philly Workforce Job Tracker",
   "description": "Automated job posting tracker for Philadelphia employer partners, identifying new openings within the last 15 days.",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
