@@ -40,6 +40,105 @@ const getAI = () => {
   return aiInstance;
 };
 
+// Robust JSON parser that handles markdown fences, unescaped control characters, tabs, newlines, and truncated chunks
+function sanitizeJobsArray(arr: any[]): any[] {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .filter((item) => item && typeof item === "object" && typeof item.title === "string")
+    .map((item) => ({
+      title: String(item.title || "").trim(),
+      url: String(item.url || "").trim(),
+      location: String(item.location || "Philadelphia, PA").trim(),
+      city: String(item.city || "Philadelphia").trim(),
+      roleType: String(item.roleType || "Full-time").trim(),
+      postedDate: String(item.postedDate || "").trim(),
+      description: String(item.description || "").trim(),
+    }))
+    .filter((item) => item.title.length > 0 && item.url.startsWith("http"));
+}
+
+function parseAndCleanJobsJson(rawText: string): any[] {
+  if (!rawText || typeof rawText !== "string") return [];
+
+  let text = rawText.trim();
+  if (text.startsWith("```")) {
+    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+
+  // 1. Direct standard parse
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return sanitizeJobsArray(parsed);
+    if (parsed && Array.isArray(parsed.jobs)) return sanitizeJobsArray(parsed.jobs);
+  } catch (e) {
+    // Continue to repair
+  }
+
+  // 2. Extract array substring
+  const firstBracket = text.indexOf("[");
+  const lastBracket = text.lastIndexOf("]");
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    const arrayStr = text.substring(firstBracket, lastBracket + 1);
+    try {
+      const parsed = JSON.parse(arrayStr);
+      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed);
+    } catch (e) {}
+
+    // 3. Fix unescaped control characters and trailing commas
+    try {
+      const sanitized = arrayStr
+        .replace(/[\x00-\x1F\x7F]/g, (char) => {
+          if (char === "\t") return " ";
+          if (char === "\n") return "\\n";
+          if (char === "\r") return "";
+          return "";
+        })
+        .replace(/,\s*([\]}])/g, "$1");
+      const parsed = JSON.parse(sanitized);
+      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed);
+    } catch (e) {}
+  }
+
+  // 4. Regex extraction of individual job objects (resilient to broken or truncated JSON streams)
+  const recoveredJobs: any[] = [];
+  const objectRegex = /\{[\s\S]*?"title"[\s\S]*?"url"[\s\S]*?\}/g;
+  let match: RegExpExecArray | null;
+  while ((match = objectRegex.exec(text)) !== null) {
+    try {
+      const objStr = match[0]
+        .replace(/[\x00-\x1F\x7F]/g, (char) => (char === "\t" ? " " : char === "\n" ? "\\n" : ""))
+        .replace(/,\s*([\]}])/g, "$1");
+      const obj = JSON.parse(objStr);
+      if (obj && obj.title && obj.url) {
+        recoveredJobs.push(obj);
+      }
+    } catch (err) {
+      try {
+        const titleMatch = match[0].match(/"title"\s*:\s*"([^"]+)"/);
+        const urlMatch = match[0].match(/"url"\s*:\s*"([^"]+)"/);
+        const locationMatch = match[0].match(/"location"\s*:\s*"([^"]+)"/);
+        const cityMatch = match[0].match(/"city"\s*:\s*"([^"]+)"/);
+        const roleTypeMatch = match[0].match(/"roleType"\s*:\s*"([^"]+)"/);
+        const postedDateMatch = match[0].match(/"postedDate"\s*:\s*"([^"]+)"/);
+        const descriptionMatch = match[0].match(/"description"\s*:\s*"([^"]+)"/);
+        if (titleMatch && urlMatch) {
+          recoveredJobs.push({
+            title: titleMatch[1],
+            url: urlMatch[1],
+            location: locationMatch ? locationMatch[1] : "Philadelphia, PA",
+            city: cityMatch ? cityMatch[1] : "Philadelphia",
+            roleType: roleTypeMatch ? roleTypeMatch[1] : "Full-time",
+            postedDate: postedDateMatch ? postedDateMatch[1] : "",
+            description: descriptionMatch ? descriptionMatch[1] : "",
+          });
+        }
+      } catch (e) {}
+    }
+  }
+
+  return sanitizeJobsArray(recoveredJobs);
+}
+
 // API Endpoint: Get Gemini Status
 app.get("/api/gemini-status", (req, res) => {
   res.json({ configured: isGeminiConfigured() });
@@ -63,55 +162,76 @@ app.post("/api/scan-jobs", async (req, res) => {
   const prompt = `Find current job openings at ${employerName}.
   - LOCATION: Greater Philadelphia area (Philly, SE Pennsylvania, or South Jersey).
   - RECENCY: Focus on jobs posted in the last 2-3 weeks.
-  - LINKS: You MUST provide the specific, direct URL to each individual job posting. Avoid the general careers home page.
+  - LINKS: You MUST provide the specific, direct URL to each individual job posting (e.g. Workday, Greenhouse, Lever, Taleo, or company career page). Avoid generic home pages.
   - WEBSITE FOR REFERENCE: ${website || "No official website provided"}
   
-  Return the results as a JSON array of objects.
-  Each object MUST have: title, url (direct link), location, city, roleType (Full-time, Part-time, Contract, or Internship), postedDate (YYYY-MM-DD), and a brief description.
+  Return a JSON array of up to 10 most recent jobs.
+  Each object MUST have: title, url (direct link starting with http), location, city, roleType (Full-time, Part-time, Contract, or Internship), postedDate (YYYY-MM-DD), and a brief description.
   
   If you find no relevant jobs in the Philadelphia area, return an empty array [].`;
 
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING, description: "The specific job title as listed on the posting" },
-              url: { type: Type.STRING, description: "The DIRECT link to the specific job posting page" },
-              location: { type: Type.STRING, description: "Full location string (e.g., 'Philadelphia, PA')" },
-              city: { type: Type.STRING, description: "The specific city (e.g., 'Philadelphia', 'Camden', 'Norristown')" },
-              roleType: { type: Type.STRING, description: "Employment type: 'Full-time', 'Part-time', 'Contract', 'Temporary', or 'Internship'" },
-              postedDate: { type: Type.STRING, description: "The date the job was posted in YYYY-MM-DD format." },
-              description: { type: Type.STRING, description: "A concise 1-2 sentence summary of the role's key responsibilities." }
-            },
-            required: ["title", "url", "location", "city", "roleType"]
+  const MAX_RETRIES = 3;
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3.7-flash",
+        contents: prompt,
+        config: {
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING, description: "The specific job title as listed on the posting" },
+                url: { type: Type.STRING, description: "The DIRECT link to the specific job posting page" },
+                location: { type: Type.STRING, description: "Full location string (e.g., 'Philadelphia, PA')" },
+                city: { type: Type.STRING, description: "The specific city (e.g., 'Philadelphia', 'Camden', 'Norristown')" },
+                roleType: { type: Type.STRING, description: "Employment type: 'Full-time', 'Part-time', 'Contract', 'Temporary', or 'Internship'" },
+                postedDate: { type: Type.STRING, description: "The date the job was posted in YYYY-MM-DD format." },
+                description: { type: Type.STRING, description: "A concise 1-2 sentence summary of the role's key responsibilities." }
+              },
+              required: ["title", "url", "location", "city", "roleType"]
+            }
           }
         }
-      }
-    });
+      });
 
-    if (response && response.text) {
-      try {
-        const jobs = JSON.parse(response.text);
+      if (response && response.text) {
+        const jobs = parseAndCleanJobsJson(response.text);
         return res.json({ jobs });
-      } catch (parseError: any) {
-        console.error("Failed to parse Gemini JSON response:", response.text, parseError);
-        return res.json({ jobs: [], warning: "Could not parse Gemini JSON response", rawText: response.text });
       }
-    }
 
-    console.warn(`No response text from Gemini for ${employerName}`);
-    return res.json({ jobs: [] });
-  } catch (error: any) {
-    console.error(`Error scanning jobs for ${employerName}:`, error);
-    return res.status(500).json({ error: error.message || "An error occurred during Gemini scanning." });
+      console.warn(`No response text from Gemini for ${employerName}`);
+      return res.json({ jobs: [] });
+    } catch (error: any) {
+      lastError = error;
+      const errorMsg = error?.message || String(error);
+      const isRateLimit = error?.status === 429 || 
+        errorMsg.includes("429") || 
+        errorMsg.includes("RESOURCE_EXHAUSTED") || 
+        errorMsg.includes("quota") ||
+        errorMsg.includes("rate-limits");
+
+      if (isRateLimit && attempt < MAX_RETRIES) {
+        const waitMs = (attempt + 1) * 8000 + Math.floor(Math.random() * 2000);
+        console.warn(`[Gemini Free Tier Pacing] Rate limit 429 encountered for ${employerName}. Retrying in ${waitMs}ms (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
+
+      console.error(`Error scanning jobs for ${employerName}:`, error);
+      if (isRateLimit) {
+        return res.status(429).json({ 
+          error: `Free tier rate limit reached for ${employerName}. Please wait 15-30 seconds before scanning more employers.`,
+          isRateLimit: true 
+        });
+      }
+      return res.status(500).json({ error: error.message || "An error occurred during Gemini scanning." });
+    }
   }
 });
 

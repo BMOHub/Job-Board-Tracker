@@ -85,6 +85,7 @@ export default function App() {
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [selectedRoleType, setSelectedRoleType] = useState('All');
   const [selectedCity, setSelectedCity] = useState('All');
+  const [selectedTimeframe, setSelectedTimeframe] = useState<'7d' | '14d' | '30d' | 'all'>('30d');
   const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'employer' | 'title'>('newest');
   const [activeTab, setActiveTab] = useState<'jobs' | 'employers'>('jobs');
   const [isScanning, setIsScanning] = useState(false);
@@ -96,6 +97,7 @@ export default function App() {
   const [showEmployerModal, setShowEmployerModal] = useState(false);
   const [editingEmployer, setEditingEmployer] = useState<Employer | null>(null);
   const [scanProgress, setScanProgress] = useState({ current: 0, total: 0, employer: '' });
+  const [cooldownCountdown, setCooldownCountdown] = useState<number | null>(null);
   const [apiConfigured, setApiConfigured] = useState<boolean>(true);
   const abortControllerRef = useMemo(() => ({ current: false }), []);
 
@@ -237,28 +239,139 @@ export default function App() {
     }
   };
 
-  const scanAll = async () => {
+  const scanAll = async (mode: 'all' | 'unscanned' = 'unscanned') => {
+    if (isScanning) return;
+
+    // Filter if mode is 'unscanned' (unscanned or not scanned in the last 24 hours)
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const targetEmployers = mode === 'unscanned'
+      ? employers.filter(e => {
+          if (!e.lastScanned) return true;
+          const millis = e.lastScanned?.toMillis ? e.lastScanned.toMillis() : (e.lastScanned?.getTime ? e.lastScanned.getTime() : 0);
+          return millis < oneDayAgo;
+        })
+      : employers;
+
+    if (targetEmployers.length === 0) {
+      setScanError("All employer partners have already been scanned within the past 24 hours. You can click 'Scan All Partners' to force a fresh scan of everyone.");
+      return;
+    }
+
+    setIsScanning(true);
+    setScanError(null);
+    abortControllerRef.current = false;
+    setScanProgress({ current: 0, total: targetEmployers.length, employer: '' });
+
+    let scanFailedCount = 0;
+
+    for (let i = 0; i < targetEmployers.length; i++) {
+      if (abortControllerRef.current) break;
+      
+      const employer = targetEmployers[i];
+      setScanProgress({ current: i + 1, total: targetEmployers.length, employer: employer.name });
+      
+      let retryCount = 0;
+      let success = false;
+
+      while (!success && retryCount < 2 && !abortControllerRef.current) {
+        try {
+          const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
+          
+          for (const job of foundJobs) {
+            if (abortControllerRef.current) break;
+
+            // Improved duplicate check: URL or (Title + Employer)
+            const qUrl = query(collection(db, 'jobPostings'), where('url', '==', job.url));
+            const qTitle = query(collection(db, 'jobPostings'), 
+              where('employerId', '==', employer.id),
+              where('title', '==', job.title)
+            );
+            
+            const [existingUrl, existingTitle] = await Promise.all([
+              getDocs(qUrl),
+              getDocs(qTitle)
+            ]);
+            
+            if (existingUrl.empty && existingTitle.empty) {
+              const postedDate = job.postedDate ? new Date(job.postedDate) : null;
+              const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
+
+              await addDoc(collection(db, 'jobPostings'), {
+                employerId: employer.id,
+                employerName: employer.name,
+                title: job.title,
+                location: job.location || 'Philadelphia, PA',
+                city: job.city || 'Philadelphia',
+                roleType: job.roleType || 'Full-time',
+                url: job.url,
+                postedDate: validPostedDate,
+                foundDate: serverTimestamp(),
+                description: job.description || ''
+              });
+            }
+          }
+
+          await setDoc(doc(db, 'employers', employer.id), {
+            lastScanned: serverTimestamp()
+          }, { merge: true });
+
+          success = true;
+
+        } catch (error: any) {
+          const errMsg = error?.message || String(error);
+          const isRateLimit = errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED") || errMsg.includes("quota") || errMsg.includes("rate limit");
+
+          if (isRateLimit && retryCount < 1 && !abortControllerRef.current) {
+            retryCount++;
+            console.warn(`[Free Tier Cooldown] Pausing 20s to recover free quota before retrying ${employer.name}...`);
+            for (let c = 20; c > 0; c--) {
+              if (abortControllerRef.current) break;
+              setCooldownCountdown(c);
+              await new Promise(r => setTimeout(r, 1000));
+            }
+            setCooldownCountdown(null);
+            continue;
+          }
+
+          console.error(`Error scanning ${employer.name}:`, error);
+          scanFailedCount++;
+          // Instead of breaking whole scan, note the error and continue to other employers
+          setScanError(`Free tier quota pause on ${employer.name}. Continuing scan for remaining partners...`);
+          break;
+        }
+      }
+
+      // Safe free-tier inter-request pacing: 6 seconds between employers
+      if (i < targetEmployers.length - 1 && !abortControllerRef.current) {
+        await new Promise(r => setTimeout(r, 6000));
+      }
+    }
+
+    setCooldownCountdown(null);
+    if (scanFailedCount === 0) {
+      setScanError(null);
+    }
+    setIsScanning(false);
+    setScanProgress({ current: 0, total: 0, employer: '' });
+  };
+
+  const scanEmployer = async (employer: Employer) => {
     if (isScanning) return;
     setIsScanning(true);
     setScanError(null);
     abortControllerRef.current = false;
-    setScanProgress({ current: 0, total: employers.length, employer: '' });
+    setScanProgress({ current: 1, total: 1, employer: employer.name });
 
-    let scanFailed = false;
+    let retryCount = 0;
+    let success = false;
 
-    for (let i = 0; i < employers.length; i++) {
-      if (abortControllerRef.current) break;
-      
-      const employer = employers[i];
-      setScanProgress({ current: i + 1, total: employers.length, employer: employer.name });
-      
+    while (!success && retryCount < 2 && !abortControllerRef.current) {
       try {
         const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
         
         for (const job of foundJobs) {
           if (abortControllerRef.current) break;
 
-          // Improved duplicate check: URL or (Title + Employer)
           const qUrl = query(collection(db, 'jobPostings'), where('url', '==', job.url));
           const qTitle = query(collection(db, 'jobPostings'), 
             where('employerId', '==', employer.id),
@@ -293,78 +406,38 @@ export default function App() {
           lastScanned: serverTimestamp()
         }, { merge: true });
 
+        success = true;
+
       } catch (error: any) {
-        console.error(`Error scanning ${employer.name}:`, error);
-        setScanError(`Scan failed for ${employer.name}: ${error.message || 'Unknown error'}`);
-        scanFailed = true;
-      }
-    }
+        const errMsg = error?.message || String(error);
+        const isRateLimit = errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED") || errMsg.includes("quota");
 
-    if (!scanFailed) {
-      setScanError(null);
-    }
-    setIsScanning(false);
-    setScanProgress({ current: 0, total: 0, employer: '' });
-  };
-
-  const scanEmployer = async (employer: Employer) => {
-    if (isScanning) return;
-    setIsScanning(true);
-    setScanError(null);
-    abortControllerRef.current = false;
-    setScanProgress({ current: 1, total: 1, employer: employer.name });
-
-    try {
-      const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
-      
-      for (const job of foundJobs) {
-        if (abortControllerRef.current) break;
-
-        const qUrl = query(collection(db, 'jobPostings'), where('url', '==', job.url));
-        const qTitle = query(collection(db, 'jobPostings'), 
-          where('employerId', '==', employer.id),
-          where('title', '==', job.title)
-        );
-        
-        const [existingUrl, existingTitle] = await Promise.all([
-          getDocs(qUrl),
-          getDocs(qTitle)
-        ]);
-        
-        if (existingUrl.empty && existingTitle.empty) {
-          const postedDate = job.postedDate ? new Date(job.postedDate) : null;
-          const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
-
-          await addDoc(collection(db, 'jobPostings'), {
-            employerId: employer.id,
-            employerName: employer.name,
-            title: job.title,
-            location: job.location || 'Philadelphia, PA',
-            city: job.city || 'Philadelphia',
-            roleType: job.roleType || 'Full-time',
-            url: job.url,
-            postedDate: validPostedDate,
-            foundDate: serverTimestamp(),
-            description: job.description || ''
-          });
+        if (isRateLimit && retryCount < 1 && !abortControllerRef.current) {
+          retryCount++;
+          console.warn(`[Free Tier Cooldown] Pausing 15s to recover free quota before retrying ${employer.name}...`);
+          for (let c = 15; c > 0; c--) {
+            if (abortControllerRef.current) break;
+            setCooldownCountdown(c);
+            await new Promise(r => setTimeout(r, 1000));
+          }
+          setCooldownCountdown(null);
+          continue;
         }
+
+        console.error(`Error scanning ${employer.name}:`, error);
+        setScanError(isRateLimit ? `Free tier quota temporarily reached for ${employer.name}. Please wait a moment and try again.` : `Failed to scan ${employer.name}: ${errMsg}`);
+        break;
       }
-
-      await setDoc(doc(db, 'employers', employer.id), {
-        lastScanned: serverTimestamp()
-      }, { merge: true });
-
-    } catch (error: any) {
-      console.error(`Error scanning ${employer.name}:`, error);
-      setScanError(`Failed to scan ${employer.name}: ${error.message || 'Unknown error'}`);
     }
 
+    setCooldownCountdown(null);
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
   };
 
   const stopScan = () => {
     abortControllerRef.current = true;
+    setCooldownCountdown(null);
     setIsScanning(false);
   };
 
@@ -380,12 +453,17 @@ export default function App() {
   };
 
   const filteredJobs = useMemo(() => {
-    const fifteenDaysAgo = Date.now() - (15 * 24 * 60 * 60 * 1000);
+    let cutoff = 0;
+    if (selectedTimeframe === '7d') cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    else if (selectedTimeframe === '14d') cutoff = Date.now() - (14 * 24 * 60 * 60 * 1000);
+    else if (selectedTimeframe === '30d') cutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
 
     let result = jobs.filter(job => {
-      // 15-day snapshot enforcement
-      const foundTime = job.foundDate?.toMillis?.() || job.foundDate?.getTime?.() || 0;
-      if (foundTime < fifteenDaysAgo) return false;
+      // Timeframe cutoff enforcement if not 'all'
+      if (cutoff > 0) {
+        const foundTime = job.foundDate?.toMillis?.() || job.foundDate?.getTime?.() || 0;
+        if (foundTime && foundTime < cutoff) return false;
+      }
 
       const matchesSearch = job.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
                            job.employerName.toLowerCase().includes(searchTerm.toLowerCase());
@@ -407,7 +485,7 @@ export default function App() {
       if (sortBy === 'title') return (a.title || '').localeCompare(b.title || '');
       return 0;
     });
-  }, [jobs, searchTerm, selectedCategory, selectedRoleType, selectedCity, sortBy, employers]);
+  }, [jobs, searchTerm, selectedCategory, selectedRoleType, selectedCity, selectedTimeframe, sortBy, employers]);
 
   const categories = ['All', ...Array.from(new Set(employers.map(e => e.category)))];
   const roleTypes = ['All', ...Array.from(new Set(jobs.map(j => j.roleType).filter(Boolean)))];
@@ -496,6 +574,11 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-4">
+              <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-emerald-50 border border-emerald-200 rounded-full text-xs font-semibold text-emerald-700">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span>Live Synced Directory</span>
+              </div>
+
               <nav className="hidden md:flex items-center bg-slate-100 p-1 rounded-xl mr-4">
                 <button
                   id="tab-jobs"
@@ -612,37 +695,50 @@ export default function App() {
                   className="w-full pl-12 pr-4 py-3 bg-slate-50 border-none rounded-xl focus:ring-2 focus:ring-blue-500 transition-all text-slate-900"
                 />
               </div>
-              <div className="flex flex-wrap gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <button
                   onClick={exportToCSV}
-                  className="flex items-center gap-2 px-6 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl transition-all"
+                  className="flex items-center gap-2 px-5 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl transition-all"
                 >
                   <Download className="w-4 h-4" />
                   Export CSV
                 </button>
                 <button
-                  onClick={scanAll}
+                  onClick={() => scanAll('unscanned')}
                   disabled={isScanning}
-                  className={`flex items-center gap-2 px-6 py-3 font-semibold rounded-xl transition-all shadow-lg ${
+                  title="Scan partners not scanned in the last 24 hours (fastest & free-tier friendly)"
+                  className={`flex items-center gap-2 px-5 py-3 font-semibold rounded-xl transition-all shadow-lg ${
                     isScanning 
                       ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                       : 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-200'
                   }`}
                 >
                   <RefreshCw className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} />
-                  {isScanning ? 'Scanning...' : 'Scan Now'}
+                  {isScanning ? 'Scanning...' : 'Scan New / Outdated'}
+                </button>
+                <button
+                  onClick={() => scanAll('all')}
+                  disabled={isScanning}
+                  title="Force re-scan of all 44 employer partners with safe free-tier rate-pacing"
+                  className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all border ${
+                    isScanning 
+                      ? 'border-slate-200 text-slate-300 cursor-not-allowed bg-slate-50' 
+                      : 'border-slate-200 hover:bg-slate-50 text-slate-700 bg-white'
+                  }`}
+                >
+                  Scan All (44)
                 </button>
               </div>
             </div>
 
-            {!apiConfigured && (
+            {!apiConfigured && user && (
               <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-amber-700 text-xs shadow-sm">
                 <AlertCircle className="w-4 h-4 flex-shrink-0" />
                 <div className="flex-1">
-                  <span className="font-bold uppercase tracking-wider block mb-0.5">Configuration Required</span>
-                  AI Scanning requires a Google Gemini API Key. Since you are running this from GitHub, you must set the 
+                  <span className="font-bold uppercase tracking-wider block mb-0.5">Admin Scanning Setup Note</span>
+                  To trigger new background AI scans from standalone deployments (e.g. Vercel), set 
                   <code className="mx-1 px-1 bg-white rounded border border-amber-200 font-mono">VITE_GEMINI_API_KEY</code> 
-                  environment variable in your build settings (e.g. Vercel, Netlify, or GitHub Actions).
+                  in your deployment settings. Viewers can browse and filter existing database postings without any key.
                 </div>
               </div>
             )}
@@ -699,6 +795,17 @@ export default function App() {
                 ))}
               </select>
 
+              <select
+                value={selectedTimeframe}
+                onChange={(e) => setSelectedTimeframe(e.target.value as any)}
+                className="px-4 py-2 bg-slate-50 border-none rounded-lg focus:ring-2 focus:ring-blue-500 transition-all text-sm text-slate-700 font-medium cursor-pointer"
+              >
+                <option value="7d">Found in Last 7 Days</option>
+                <option value="14d">Found in Last 14 Days</option>
+                <option value="30d">Found in Last 30 Days</option>
+                <option value="all">All Active Postings</option>
+              </select>
+
               <div className="h-6 w-px bg-slate-200 mx-2 hidden sm:block" />
 
               <div className="flex items-center gap-2 text-xs font-bold text-slate-400 uppercase tracking-wider mr-2">
@@ -726,37 +833,44 @@ export default function App() {
                 exit={{ height: 0, opacity: 0 }}
                 className="mt-4 pt-4 border-t border-slate-100 overflow-hidden"
               >
-                <div className="flex justify-between text-sm font-medium text-slate-600 mb-2">
+                <div className="flex flex-wrap items-center justify-between text-sm font-medium text-slate-600 mb-2 gap-2">
                   <span className="flex items-center gap-2">
                     <RefreshCw className="w-4 h-4 animate-spin text-blue-600" />
-                    Scanning: {scanProgress.employer}
+                    {cooldownCountdown !== null ? (
+                      <span className="text-amber-600 font-semibold bg-amber-50 px-2 py-0.5 rounded border border-amber-200 animate-pulse">
+                        ⏳ Free-Tier Pacing: Resuming in {cooldownCountdown}s...
+                      </span>
+                    ) : (
+                      <span>Scanning: <strong className="text-slate-800">{scanProgress.employer}</strong></span>
+                    )}
                   </span>
                   <div className="flex items-center gap-4">
                     {scanError && (
-                      <span className="text-red-500 text-[10px] font-bold bg-red-50 px-2 py-0.5 rounded border border-red-100 flex items-center gap-1">
+                      <span className="text-amber-600 text-[11px] font-medium bg-amber-50 px-2 py-0.5 rounded border border-amber-200 flex items-center gap-1">
                         <AlertCircle className="w-3 h-3" />
-                        API Error Detected
+                        Pacing / Quota Note
                       </span>
                     )}
-                    <span>{scanProgress.current} / {scanProgress.total}</span>
+                    <span className="font-mono text-xs text-slate-500">{scanProgress.current} / {scanProgress.total}</span>
                     <button 
                       onClick={stopScan}
-                      className="text-red-500 hover:text-red-700 font-bold"
+                      className="text-red-500 hover:text-red-700 font-bold text-xs px-2 py-1 bg-red-50 hover:bg-red-100 rounded transition-all"
                     >
-                      Stop
+                      Stop Scan
                     </button>
                   </div>
                 </div>
                 <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
                   <motion.div 
-                    className="h-full bg-blue-600"
+                    className="h-full bg-blue-600 transition-all duration-300"
                     initial={{ width: 0 }}
                     animate={{ width: `${(scanProgress.current / scanProgress.total) * 100}%` }}
                   />
                 </div>
-                <p className="text-[10px] text-slate-400 mt-2 italic">
-                  Note: AI is verifying links and filtering for Greater Philadelphia region (including surrounding counties).
-                </p>
+                <div className="flex items-center justify-between mt-2 text-[11px] text-slate-400">
+                  <span>✨ 100% Free Quota Safe: Inter-request pacing & backoff active</span>
+                  <span>Verifying live direct links for Greater Philadelphia region</span>
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
