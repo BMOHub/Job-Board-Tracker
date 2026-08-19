@@ -38,7 +38,9 @@ import {
   KeyRound,
   Eye,
   EyeOff,
-  Compass
+  Compass,
+  Zap,
+  Layers
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { db } from './lib/firebase';
@@ -90,7 +92,7 @@ export default function App() {
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showEmployerModal, setShowEmployerModal] = useState(false);
   const [editingEmployer, setEditingEmployer] = useState<Employer | null>(null);
-  const [scanProgress, setScanProgress] = useState({ current: 0, total: 0, employer: '' });
+  const [scanProgress, setScanProgress] = useState<{ current: number; total: number; employer: string; category?: string }>({ current: 0, total: 0, employer: '' });
   const [cooldownCountdown, setCooldownCountdown] = useState<number | null>(null);
   const [apiConfigured, setApiConfigured] = useState<boolean>(true);
   const abortControllerRef = useMemo(() => ({ current: false }), []);
@@ -262,28 +264,51 @@ export default function App() {
     }
   };
 
-  const scanAll = async (mode: 'all' | 'unscanned' = 'unscanned') => {
+  const scanAll = async (mode: 'all' | 'unscanned' | 'category' = 'unscanned', categoryName?: string) => {
     if (isScanning) return;
 
-    // Filter if mode is 'unscanned' (unscanned or not scanned in the last 24 hours)
-    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-    const targetEmployers = mode === 'unscanned'
-      ? employers.filter(e => {
-          if (!e.lastScanned) return true;
-          const millis = e.lastScanned?.toMillis ? e.lastScanned.toMillis() : (e.lastScanned?.getTime ? e.lastScanned.getTime() : 0);
-          return millis < oneDayAgo;
-        })
-      : employers;
+    let targetEmployers: Employer[] = [];
+    let scanScopeTitle = '';
+
+    if (mode === 'category') {
+      const cat = categoryName || selectedCategory;
+      if (!cat || cat === 'All') {
+        setScanError("Please select a specific industry category to scan.");
+        return;
+      }
+      targetEmployers = employers.filter(e => e.category === cat);
+      scanScopeTitle = `${cat} (${targetEmployers.length} partners)`;
+    } else if (mode === 'unscanned') {
+      const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      targetEmployers = employers.filter(e => {
+        if (!e.lastScanned) return true;
+        const millis = e.lastScanned?.toMillis ? e.lastScanned.toMillis() : (e.lastScanned?.getTime ? e.lastScanned.getTime() : 0);
+        return millis < oneDayAgo;
+      });
+      scanScopeTitle = `New / Outdated (${targetEmployers.length} partners)`;
+    } else {
+      targetEmployers = employers;
+      scanScopeTitle = `All (${targetEmployers.length} partners)`;
+    }
 
     if (targetEmployers.length === 0) {
-      setScanError("All employer partners have already been scanned within the past 24 hours. You can click 'Scan All (44)' to force a fresh scan of everyone.");
+      if (mode === 'category') {
+        setScanError(`No employer partners found under "${categoryName || selectedCategory}".`);
+      } else {
+        setScanError("All employer partners have already been scanned within the past 24 hours. You can click 'Scan All (44)' or select a specific category to scan.");
+      }
       return;
     }
 
     setIsScanning(true);
     setScanError(null);
     abortControllerRef.current = false;
-    setScanProgress({ current: 0, total: targetEmployers.length, employer: '' });
+    setScanProgress({ 
+      current: 0, 
+      total: targetEmployers.length, 
+      employer: '', 
+      category: mode === 'category' ? (categoryName || selectedCategory) : undefined 
+    });
 
     let scanFailedCount = 0;
 
@@ -291,7 +316,12 @@ export default function App() {
       if (abortControllerRef.current) break;
       
       const employer = targetEmployers[i];
-      setScanProgress({ current: i + 1, total: targetEmployers.length, employer: employer.name });
+      setScanProgress({ 
+        current: i + 1, 
+        total: targetEmployers.length, 
+        employer: employer.name,
+        category: mode === 'category' ? (categoryName || selectedCategory) : undefined 
+      });
       
       let retryCount = 0;
       let success = false;
@@ -510,9 +540,9 @@ export default function App() {
     });
   }, [jobs, searchTerm, selectedCategory, selectedRoleType, selectedCity, selectedTimeframe, sortBy, employers]);
 
-  const categories = ['All', ...Array.from(new Set(employers.map(e => e.category)))];
-  const roleTypes = ['All', ...Array.from(new Set(jobs.map(j => j.roleType).filter(Boolean)))];
-  const cities = ['All', ...Array.from(new Set(jobs.map(j => j.city).filter(Boolean)))];
+  const categories: string[] = ['All', ...Array.from(new Set<string>(employers.map(e => e.category).filter((c): c is string => Boolean(c))))];
+  const roleTypes: string[] = ['All', ...Array.from(new Set<string>(jobs.map(j => j.roleType).filter((r): r is string => Boolean(r))))];
+  const cities: string[] = ['All', ...Array.from(new Set<string>(jobs.map(j => j.city).filter((c): c is string => Boolean(c))))];
 
   const exportToCSV = () => {
     const headers = ['Employer', 'Category', 'Job Title', 'Role Type', 'City', 'Location', 'URL', 'Found Date'];
@@ -714,35 +744,52 @@ export default function App() {
               <div className="flex flex-wrap items-center gap-3">
                 <button
                   onClick={exportToCSV}
-                  className="flex items-center gap-2 px-5 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl transition-all cursor-pointer"
+                  className="flex items-center gap-2 px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl transition-all cursor-pointer text-sm"
                 >
                   <Download className="w-4 h-4" />
                   Export CSV
                 </button>
+
+                {selectedCategory !== 'All' && (
+                  <button
+                    onClick={() => scanAll('category', selectedCategory)}
+                    disabled={isScanning}
+                    title={`Scan only employers in ${selectedCategory} (fast & quota-safe)`}
+                    className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
+                      isScanning 
+                        ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
+                        : 'bg-amber-500 hover:bg-amber-600 text-white shadow-amber-200'
+                    }`}
+                  >
+                    <Zap className={`w-4 h-4 ${isScanning ? 'animate-bounce' : ''}`} />
+                    <span>Scan {selectedCategory} ({employers.filter(e => e.category === selectedCategory).length})</span>
+                  </button>
+                )}
+
                 <button
                   onClick={() => scanAll('unscanned')}
                   disabled={isScanning}
                   title="Scan partners not scanned in the last 24 hours (fastest & free-tier friendly)"
-                  className={`flex items-center gap-2 px-5 py-3 font-semibold rounded-xl transition-all shadow-lg cursor-pointer ${
+                  className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
                     isScanning 
                       ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                       : 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-200'
                   }`}
                 >
                   <RefreshCw className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} />
-                  {isScanning ? 'Scanning...' : 'Scan New / Outdated'}
+                  {isScanning ? 'Scanning...' : 'Scan Outdated'}
                 </button>
                 <button
                   onClick={() => scanAll('all')}
                   disabled={isScanning}
                   title="Force re-scan of all 44 employer partners with safe free-tier rate-pacing"
-                  className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all border cursor-pointer ${
+                  className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all border text-sm cursor-pointer ${
                     isScanning 
                       ? 'border-slate-200 text-slate-300 cursor-not-allowed bg-slate-50' 
                       : 'border-slate-200 hover:bg-slate-50 text-slate-700 bg-white'
                   }`}
                 >
-                  Scan All (44)
+                  Scan All ({employers.length})
                 </button>
               </div>
             </div>
@@ -759,6 +806,33 @@ export default function App() {
                 </button>
               </div>
             )}
+
+            {/* Quick Category Scan Bar */}
+            <div className="pt-2 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-slate-500 uppercase tracking-wider whitespace-nowrap">
+                <Zap className="w-3.5 h-3.5 text-amber-500" />
+                <span>Fast Category Scans:</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {categories.filter(c => c !== 'All').map(cat => {
+                  const count = employers.filter(e => e.category === cat).length;
+                  return (
+                    <button
+                      key={cat}
+                      onClick={() => scanAll('category', cat)}
+                      disabled={isScanning}
+                      title={`Quick scan ${cat} (${count} partners) - ~${Math.max(count * 6, 10)} seconds`}
+                      className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 hover:bg-amber-50 hover:text-amber-700 hover:border-amber-300 text-slate-700 text-xs font-medium rounded-lg border border-slate-200/70 transition-all cursor-pointer disabled:opacity-50"
+                    >
+                      <span>{cat}</span>
+                      <span className="text-[10px] bg-white text-slate-500 px-1 rounded border border-slate-200 font-mono">
+                        {count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
 
             <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-slate-50">
               <div className="flex items-center gap-2 text-xs font-bold text-slate-400 uppercase tracking-wider mr-2">
@@ -845,7 +919,15 @@ export default function App() {
                         ⏳ Free-Tier Pacing: Resuming in {cooldownCountdown}s...
                       </span>
                     ) : (
-                      <span>Scanning: <strong className="text-slate-800">{scanProgress.employer}</strong></span>
+                      <span className="flex items-center gap-2">
+                        {scanProgress.category && (
+                          <span className="text-xs font-bold bg-amber-100 text-amber-800 px-2 py-0.5 rounded flex items-center gap-1">
+                            <Zap className="w-3 h-3 text-amber-600" />
+                            {scanProgress.category}
+                          </span>
+                        )}
+                        <span>Scanning: <strong className="text-slate-800">{scanProgress.employer}</strong></span>
+                      </span>
                     )}
                   </span>
                   <div className="flex items-center gap-4">
@@ -996,7 +1078,15 @@ export default function App() {
                 <div key={emp.id} className="bg-white rounded-2xl shadow-sm border border-slate-100 flex flex-col justify-between overflow-hidden group">
                   <div className="p-5">
                     <div className="flex justify-between items-start">
-                      <span className="text-[10px] font-bold text-blue-600 uppercase tracking-widest bg-blue-50 px-2 py-0.5 rounded">{emp.category}</span>
+                      <button
+                        onClick={() => scanAll('category', emp.category)}
+                        disabled={isScanning}
+                        title={`Click to scan all ${emp.category} partner employers`}
+                        className="text-[10px] font-bold text-blue-700 uppercase tracking-widest bg-blue-50 hover:bg-amber-100 hover:text-amber-800 px-2 py-0.5 rounded flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        <span>{emp.category}</span>
+                        <Zap className="w-2.5 h-2.5 text-amber-500" />
+                      </button>
                       <button 
                         onClick={() => requireAdmin(() => {
                           setEditingEmployer(emp);
