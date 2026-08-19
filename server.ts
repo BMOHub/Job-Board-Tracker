@@ -40,24 +40,150 @@ const getAI = () => {
   return aiInstance;
 };
 
+// Robust URL validator and enhancer using Google Search grounding metadata
+function findBestJobUrl(
+  rawUrl: string, 
+  jobTitle: string, 
+  employerName: string, 
+  website: string, 
+  groundingChunks: any[]
+): string {
+  let url = (rawUrl || "").trim();
+
+  // Helper to check if URL is generic or top-level homepage/careers root
+  const isGenericOrHomepage = (u: string): boolean => {
+    if (!u || !u.startsWith("http")) return true;
+    try {
+      const parsed = new URL(u);
+      const pathname = parsed.pathname.toLowerCase().replace(/\/$/, "");
+      
+      // Bare domain (e.g., https://example.com or https://example.com/)
+      if (!pathname || pathname === "") return true;
+
+      // Generic single-segment career root pages without specific job IDs
+      const genericPaths = [
+        "/careers", "/career", "/jobs", "/job", "/work-with-us", 
+        "/join-us", "/about/careers", "/pages/careers", "/en-us",
+        "/about", "/about-us", "/home", "/employment"
+      ];
+      if (genericPaths.includes(pathname) && !parsed.search && !parsed.hash) {
+        return true;
+      }
+
+      // Matches employer's generic website exactly
+      if (website) {
+        try {
+          const empParsed = new URL(website);
+          if (parsed.hostname === empParsed.hostname && (pathname === empParsed.pathname.toLowerCase().replace(/\/$/, ""))) {
+            return true;
+          }
+        } catch (e) {}
+      }
+
+      return false;
+    } catch (e) {
+      return true;
+    }
+  };
+
+  // 1. If we have grounding chunks from Google Search, try to find a verified deep link matching the job
+  if (Array.isArray(groundingChunks) && groundingChunks.length > 0) {
+    const validUris = groundingChunks
+      .map(c => ({
+        uri: c?.web?.uri || "",
+        title: c?.web?.title || ""
+      }))
+      .filter(item => item.uri && item.uri.startsWith("http"));
+
+    // Check if any grounding chunk URI contains known ATS keywords or job-specific paths
+    const titleWords = jobTitle.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    
+    // First, look for a grounding chunk that mentions title words and is not generic
+    for (const chunk of validUris) {
+      const chunkUri = chunk.uri.toLowerCase();
+      const chunkTitle = chunk.title.toLowerCase();
+
+      const isAtsLink = chunkUri.includes("myworkdayjobs.com") ||
+                        chunkUri.includes("greenhouse.io") ||
+                        chunkUri.includes("lever.co") ||
+                        chunkUri.includes("taleo.net") ||
+                        chunkUri.includes("oraclecloud.com") ||
+                        chunkUri.includes("icims.com") ||
+                        chunkUri.includes("smartrecruiters.com") ||
+                        chunkUri.includes("ultipro.com") ||
+                        chunkUri.includes("ukg.com") ||
+                        chunkUri.includes("bamboohr.com") ||
+                        chunkUri.includes("adp.com") ||
+                        chunkUri.includes("jobvite.com") ||
+                        chunkUri.includes("linkedin.com/jobs/view") ||
+                        chunkUri.includes("indeed.com/viewjob") ||
+                        chunkUri.includes("ziprecruiter.com/jobs");
+
+      const matchesTitle = titleWords.some(w => chunkTitle.includes(w) || chunkUri.includes(w));
+      
+      if (isAtsLink && matchesTitle) {
+        return chunk.uri;
+      }
+    }
+
+    // If the original URL is generic, pick the best non-generic grounding URI
+    if (isGenericOrHomepage(url)) {
+      for (const chunk of validUris) {
+        if (!isGenericOrHomepage(chunk.uri)) {
+          const chunkTitle = chunk.title.toLowerCase();
+          const matchesTitle = titleWords.some(w => chunkTitle.includes(w));
+          if (matchesTitle) {
+            return chunk.uri;
+          }
+        }
+      }
+    }
+  }
+
+  // 2. If the URL is valid and non-generic, return it
+  if (!isGenericOrHomepage(url)) {
+    return url;
+  }
+
+  // 3. If the URL is STILL generic, fall back to a precision targeted query link so users never get a broken 404
+  const searchFallback = `https://www.google.com/search?q=${encodeURIComponent(employerName + ' ' + jobTitle + ' jobs philadelphia')}`;
+  return url && url.startsWith("http") ? url : searchFallback;
+}
+
 // Robust JSON parser that handles markdown fences, unescaped control characters, tabs, newlines, and truncated chunks
-function sanitizeJobsArray(arr: any[]): any[] {
+function sanitizeJobsArray(
+  arr: any[], 
+  employerName = "", 
+  website = "", 
+  groundingChunks: any[] = []
+): any[] {
   if (!Array.isArray(arr)) return [];
   return arr
     .filter((item) => item && typeof item === "object" && typeof item.title === "string")
-    .map((item) => ({
-      title: String(item.title || "").trim(),
-      url: String(item.url || "").trim(),
-      location: String(item.location || "Philadelphia, PA").trim(),
-      city: String(item.city || "Philadelphia").trim(),
-      roleType: String(item.roleType || "Full-time").trim(),
-      postedDate: String(item.postedDate || "").trim(),
-      description: String(item.description || "").trim(),
-    }))
+    .map((item) => {
+      const title = String(item.title || "").trim();
+      const rawUrl = String(item.url || "").trim();
+      const bestUrl = findBestJobUrl(rawUrl, title, employerName, website, groundingChunks);
+      
+      return {
+        title: title,
+        url: bestUrl,
+        location: String(item.location || "Philadelphia, PA").trim(),
+        city: String(item.city || "Philadelphia").trim(),
+        roleType: String(item.roleType || "Full-time").trim(),
+        postedDate: String(item.postedDate || "").trim(),
+        description: String(item.description || "").trim(),
+      };
+    })
     .filter((item) => item.title.length > 0 && item.url.startsWith("http"));
 }
 
-function parseAndCleanJobsJson(rawText: string): any[] {
+function parseAndCleanJobsJson(
+  rawText: string, 
+  employerName = "", 
+  website = "", 
+  groundingChunks: any[] = []
+): any[] {
   if (!rawText || typeof rawText !== "string") return [];
 
   let text = rawText.trim();
@@ -68,8 +194,8 @@ function parseAndCleanJobsJson(rawText: string): any[] {
   // 1. Direct standard parse
   try {
     const parsed = JSON.parse(text);
-    if (Array.isArray(parsed)) return sanitizeJobsArray(parsed);
-    if (parsed && Array.isArray(parsed.jobs)) return sanitizeJobsArray(parsed.jobs);
+    if (Array.isArray(parsed)) return sanitizeJobsArray(parsed, employerName, website, groundingChunks);
+    if (parsed && Array.isArray(parsed.jobs)) return sanitizeJobsArray(parsed.jobs, employerName, website, groundingChunks);
   } catch (e) {
     // Continue to repair
   }
@@ -81,7 +207,7 @@ function parseAndCleanJobsJson(rawText: string): any[] {
     const arrayStr = text.substring(firstBracket, lastBracket + 1);
     try {
       const parsed = JSON.parse(arrayStr);
-      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed);
+      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed, employerName, website, groundingChunks);
     } catch (e) {}
 
     // 3. Fix unescaped control characters and trailing commas
@@ -95,7 +221,7 @@ function parseAndCleanJobsJson(rawText: string): any[] {
         })
         .replace(/,\s*([\]}])/g, "$1");
       const parsed = JSON.parse(sanitized);
-      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed);
+      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed, employerName, website, groundingChunks);
     } catch (e) {}
   }
 
@@ -136,7 +262,7 @@ function parseAndCleanJobsJson(rawText: string): any[] {
     }
   }
 
-  return sanitizeJobsArray(recoveredJobs);
+  return sanitizeJobsArray(recoveredJobs, employerName, website, groundingChunks);
 }
 
 // API Endpoint: Get Gemini Status
@@ -159,16 +285,26 @@ app.post("/api/scan-jobs", async (req, res) => {
     });
   }
 
-  const prompt = `Find current job openings at ${employerName}.
-  - LOCATION: Greater Philadelphia area (Philly, SE Pennsylvania, or South Jersey).
-  - RECENCY: Focus on jobs posted in the last 2-3 weeks.
-  - LINKS: You MUST provide the specific, direct URL to each individual job posting (e.g. Workday, Greenhouse, Lever, Taleo, or company career page). Avoid generic home pages.
-  - WEBSITE FOR REFERENCE: ${website || "No official website provided"}
-  
-  Return a JSON array of up to 10 most recent jobs.
-  Each object MUST have: title, url (direct link starting with http), location, city, roleType (Full-time, Part-time, Contract, or Internship), postedDate (YYYY-MM-DD), and a brief description.
-  
-  If you find no relevant jobs in the Philadelphia area, return an empty array [].`;
+  const prompt = `Find current job openings at "${employerName}" located in the Greater Philadelphia area (Philadelphia, SE Pennsylvania, Camden/South Jersey).
+  Official Reference Website: ${website || "Not provided"}
+
+  CRITICAL DEEP-LINK REQUIREMENTS:
+  - You MUST provide the exact, direct URL to each specific job posting (e.g. on Workday, Greenhouse, Lever, Taleo, iCIMS, SmartRecruiters, UKG, BambooHR, ADP, LinkedIn Jobs, or the company's direct job requisition page).
+  - DO NOT return generic root homepages (e.g. "https://example.com" or "https://example.com/careers") if a specific job requisition link exists.
+  - DO NOT hallucinate or guess fake job URLs. Use only real, verified URLs found in search results.
+  - Prioritize recent openings (posted within the last 2-4 weeks).
+
+  Return a JSON array of up to 10 openings.
+  Each object MUST contain:
+  - "title": Job title (e.g., "Case Manager", "Forklift Operator", "Teller", "Instructional Assistant")
+  - "url": The exact, direct deep-link URL to this specific job listing (must start with https:// or http://)
+  - "location": Location (e.g., "Philadelphia, PA", "Camden, NJ")
+  - "city": City name
+  - "roleType": "Full-time", "Part-time", "Contract", or "Internship"
+  - "postedDate": Date posted (YYYY-MM-DD) if available, otherwise empty string
+  - "description": 1-2 sentence description of key duties.
+
+  If no active Philadelphia-area jobs are found, return an empty array [].`;
 
   const MAX_RETRIES = 3;
   let lastError: any = null;
@@ -187,7 +323,7 @@ app.post("/api/scan-jobs", async (req, res) => {
               type: Type.OBJECT,
               properties: {
                 title: { type: Type.STRING, description: "The specific job title as listed on the posting" },
-                url: { type: Type.STRING, description: "The DIRECT link to the specific job posting page" },
+                url: { type: Type.STRING, description: "The direct, verified deep link URL to the specific job listing" },
                 location: { type: Type.STRING, description: "Full location string (e.g., 'Philadelphia, PA')" },
                 city: { type: Type.STRING, description: "The specific city (e.g., 'Philadelphia', 'Camden', 'Norristown')" },
                 roleType: { type: Type.STRING, description: "Employment type: 'Full-time', 'Part-time', 'Contract', 'Temporary', or 'Internship'" },
@@ -201,7 +337,8 @@ app.post("/api/scan-jobs", async (req, res) => {
       });
 
       if (response && response.text) {
-        const jobs = parseAndCleanJobsJson(response.text);
+        const groundingChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
+        const jobs = parseAndCleanJobsJson(response.text, employerName, website, groundingChunks);
         return res.json({ jobs });
       }
 
