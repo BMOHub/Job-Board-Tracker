@@ -311,6 +311,7 @@ export default function App() {
     });
 
     let scanFailedCount = 0;
+    let totalNewJobsAdded = 0;
 
     for (let i = 0; i < targetEmployers.length; i++) {
       if (abortControllerRef.current) break;
@@ -329,6 +330,7 @@ export default function App() {
       while (!success && retryCount < 2 && !abortControllerRef.current) {
         try {
           const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
+          let employerNewJobs = 0;
           
           for (const job of foundJobs) {
             if (abortControllerRef.current) break;
@@ -361,6 +363,8 @@ export default function App() {
                 foundDate: serverTimestamp(),
                 description: job.description || ''
               });
+              employerNewJobs++;
+              totalNewJobsAdded++;
             }
           }
 
@@ -376,8 +380,8 @@ export default function App() {
 
           if (isRateLimit && retryCount < 1 && !abortControllerRef.current) {
             retryCount++;
-            console.warn(`[Free Tier Cooldown] Pausing 20s to recover free quota before retrying ${employer.name}...`);
-            for (let c = 20; c > 0; c--) {
+            console.warn(`[API Pacing] Pausing 8s before retrying ${employer.name}...`);
+            for (let c = 8; c > 0; c--) {
               if (abortControllerRef.current) break;
               setCooldownCountdown(c);
               await new Promise(r => setTimeout(r, 1000));
@@ -388,14 +392,14 @@ export default function App() {
 
           console.error(`Error scanning ${employer.name}:`, error);
           scanFailedCount++;
-          setScanError(`Free tier quota pause on ${employer.name}. Continuing scan for remaining partners...`);
+          setScanError(`Scan notice: ${employer.name} had a temporary timeout. Continuing with remaining partners...`);
           break;
         }
       }
 
-      // Safe free-tier inter-request pacing: 6 seconds between employers
+      // Safe, brisk inter-request pacing: 2.5 seconds between employers
       if (i < targetEmployers.length - 1 && !abortControllerRef.current) {
-        await new Promise(r => setTimeout(r, 6000));
+        await new Promise(r => setTimeout(r, 2500));
       }
     }
 
@@ -416,6 +420,7 @@ export default function App() {
 
     let retryCount = 0;
     let success = false;
+    let newJobsCount = 0;
 
     while (!success && retryCount < 2 && !abortControllerRef.current) {
       try {
@@ -451,6 +456,7 @@ export default function App() {
               foundDate: serverTimestamp(),
               description: job.description || ''
             });
+            newJobsCount++;
           }
         }
 
@@ -466,8 +472,8 @@ export default function App() {
 
         if (isRateLimit && retryCount < 1 && !abortControllerRef.current) {
           retryCount++;
-          console.warn(`[Free Tier Cooldown] Pausing 15s to recover free quota before retrying ${employer.name}...`);
-          for (let c = 15; c > 0; c--) {
+          console.warn(`[API Pacing] Pausing 8s before retrying ${employer.name}...`);
+          for (let c = 8; c > 0; c--) {
             if (abortControllerRef.current) break;
             setCooldownCountdown(c);
             await new Promise(r => setTimeout(r, 1000));
@@ -477,7 +483,7 @@ export default function App() {
         }
 
         console.error(`Error scanning ${employer.name}:`, error);
-        setScanError(isRateLimit ? `Free tier quota temporarily reached for ${employer.name}. Please wait a moment and try again.` : `Failed to scan ${employer.name}: ${errMsg}`);
+        setScanError(`Failed to scan ${employer.name}: ${errMsg}`);
         break;
       }
     }

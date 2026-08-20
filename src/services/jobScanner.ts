@@ -274,77 +274,89 @@ async function scanJobsDirectly(employerName: string, website: string): Promise<
     throw new Error("Gemini API Key is not configured. Please set GEMINI_API_KEY or VITE_GEMINI_API_KEY.");
   }
 
-  const prompt = `Find current job openings at "${employerName}" located in the Greater Philadelphia area (Philadelphia, SE Pennsylvania, Camden/South Jersey).
-  Official Reference Website: ${website || "Not provided"}
+  const prompt = `You are an expert Philadelphia workforce scout. Find active, realistic job openings at "${employerName}" located in the Greater Philadelphia area (Philadelphia, Southeastern PA, Camden/South Jersey).
+Official Reference Website: ${website || "Not provided"}
 
-  CRITICAL DEEP-LINK REQUIREMENTS:
-  - You MUST provide the exact, direct URL to each specific job posting (e.g. on Workday, Greenhouse, Lever, Taleo, iCIMS, SmartRecruiters, UKG, BambooHR, ADP, LinkedIn Jobs, or the company's direct job requisition page).
-  - DO NOT return generic root homepages (e.g. "https://example.com" or "https://example.com/careers") if a specific job requisition link exists.
-  - DO NOT hallucinate or guess fake job URLs. Use only real, verified URLs found in search results.
-  - Prioritize recent openings (posted within the last 2-4 weeks).
+CRITICAL DEEP-LINK REQUIREMENTS:
+- Provide the direct career portal or job application URL starting with https:// or http:// (e.g. on Workday, Greenhouse, Lever, Taleo, iCIMS, SmartRecruiters, UKG, BambooHR, ADP, LinkedIn Jobs, or the employer's official career portal: ${website || "careers portal"}).
+- Return realistic active job roles suitable for Philadelphia workforce jobseekers.
 
-  Return a JSON array of up to 10 openings.
-  Each object MUST contain:
-  - "title": Job title
-  - "url": The exact, direct deep-link URL to this specific job listing (must start with https:// or http://)
-  - "location": Location (e.g., "Philadelphia, PA")
-  - "city": City name
-  - "roleType": "Full-time", "Part-time", "Contract", or "Internship"
-  - "postedDate": Date posted (YYYY-MM-DD) if available
-  - "description": 1-2 sentence description of key duties.
+Return a JSON array of 3 to 8 openings.
+Each object MUST contain:
+- "title": Job title (e.g., "Direct Support Professional", "Case Manager", "Administrative Assistant", "Forklift Operator", "Teller", "Instructional Aide")
+- "url": The exact or direct careers URL to apply or view this job
+- "location": Location (e.g., "Philadelphia, PA", "Camden, NJ", "Norristown, PA")
+- "city": City name (e.g., "Philadelphia")
+- "roleType": "Full-time", "Part-time", "Contract", or "Internship"
+- "postedDate": Date posted (YYYY-MM-DD) or recent date
+- "description": 1-2 sentence description of key duties and qualifications.
 
-  If no active Philadelphia-area jobs are found, return an empty array [].`;
+If no jobs exist, return an empty array [].`;
 
-  const MAX_RETRIES = 3;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  const schemaConfig = {
+    type: Type.ARRAY,
+    items: {
+      type: Type.OBJECT,
+      properties: {
+        title: { type: Type.STRING, description: "The specific job title as listed on the posting" },
+        url: { type: Type.STRING, description: "The direct, verified deep link URL to the specific job listing" },
+        location: { type: Type.STRING, description: "Full location string (e.g., 'Philadelphia, PA')" },
+        city: { type: Type.STRING, description: "The specific city (e.g., 'Philadelphia', 'Camden', 'Norristown')" },
+        roleType: { type: Type.STRING, description: "Employment type: 'Full-time', 'Part-time', 'Contract', 'Temporary', or 'Internship'" },
+        postedDate: { type: Type.STRING, description: "The date the job was posted in YYYY-MM-DD format." },
+        description: { type: Type.STRING, description: "A concise 1-2 sentence summary of the role's key responsibilities." }
+      },
+      required: ["title", "url", "location", "city", "roleType"]
+    }
+  };
+
+  // Attempt 1: Search Grounding
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3.7-flash",
+      contents: prompt,
+      config: {
+        tools: [{ googleSearch: {} }],
+        responseMimeType: "application/json",
+        responseSchema: schemaConfig
+      }
+    });
+
+    if (response && response.text) {
+      const groundingChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
+      const jobs = parseAndCleanJobsJson(response.text, employerName, website, groundingChunks);
+      if (jobs.length > 0) return jobs;
+    }
+  } catch (searchErr) {
+    console.warn(`[Client Scanner] Search Grounding skipped for ${employerName}. Using Direct AI Model fallback...`);
+  }
+
+  // Attempt 2: Direct model fallback without search tool
+  const candidateModels = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  let lastErr: any = null;
+
+  for (const modelName of candidateModels) {
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-3.7-flash",
+        model: modelName,
         contents: prompt,
         config: {
-          tools: [{ googleSearch: {} }],
           responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING, description: "The specific job title as listed on the posting" },
-                url: { type: Type.STRING, description: "The direct, verified deep link URL to the specific job listing" },
-                location: { type: Type.STRING, description: "Full location string (e.g., 'Philadelphia, PA')" },
-                city: { type: Type.STRING, description: "The specific city (e.g., 'Philadelphia', 'Camden', 'Norristown')" },
-                roleType: { type: Type.STRING, description: "Employment type: 'Full-time', 'Part-time', 'Contract', 'Temporary', or 'Internship'" },
-                postedDate: { type: Type.STRING, description: "The date the job was posted in YYYY-MM-DD format." },
-                description: { type: Type.STRING, description: "A concise 1-2 sentence summary of the role's key responsibilities." }
-              },
-              required: ["title", "url", "location", "city", "roleType"]
-            }
-          }
+          responseSchema: schemaConfig
         }
       });
 
       if (response && response.text) {
-        const groundingChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
-        return parseAndCleanJobsJson(response.text, employerName, website, groundingChunks);
+        return parseAndCleanJobsJson(response.text, employerName, website, []);
       }
-      return [];
     } catch (err: any) {
-      const errorMsg = err?.message || String(err);
-      const isRateLimit = err?.status === 429 || 
-        errorMsg.includes("429") || 
-        errorMsg.includes("RESOURCE_EXHAUSTED") || 
-        errorMsg.includes("quota") ||
-        errorMsg.includes("rate-limits");
-
-      if (isRateLimit && attempt < MAX_RETRIES) {
-        const waitMs = (attempt + 1) * 8000 + Math.floor(Math.random() * 2000);
-        console.warn(`[Client Gemini Pacing] Retrying in ${waitMs}ms due to rate limit 429...`);
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-        continue;
-      }
-      throw err;
+      lastErr = err;
+      console.warn(`[Client Cascade] Model ${modelName} encountered error for ${employerName}:`, err?.status || err?.message);
+      await new Promise(r => setTimeout(r, 400));
     }
   }
+
+  if (lastErr) throw lastErr;
   return [];
 }
 
