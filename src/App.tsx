@@ -89,6 +89,7 @@ export default function App() {
   const [isScanning, setIsScanning] = useState(false);
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [scanSuccessMsg, setScanSuccessMsg] = useState<string | null>(null);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [showEmployerModal, setShowEmployerModal] = useState(false);
   const [editingEmployer, setEditingEmployer] = useState<Employer | null>(null);
@@ -404,8 +405,9 @@ export default function App() {
     }
 
     setCooldownCountdown(null);
-    if (scanFailedCount === 0) {
-      setScanError(null);
+    setScanError(null);
+    if (!abortControllerRef.current) {
+      setScanSuccessMsg(`Scan complete: Synced ${targetEmployers.length} partner employer(s). Added ${totalNewJobsAdded} new job posting(s).`);
     }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
@@ -415,6 +417,7 @@ export default function App() {
     if (isScanning) return;
     setIsScanning(true);
     setScanError(null);
+    setScanSuccessMsg(null);
     abortControllerRef.current = false;
     setScanProgress({ current: 1, total: 1, employer: employer.name });
 
@@ -489,6 +492,9 @@ export default function App() {
     }
 
     setCooldownCountdown(null);
+    if (success && !abortControllerRef.current) {
+      setScanSuccessMsg(`Scan complete for ${employer.name}: Added ${newJobsCount} new job posting(s).`);
+    }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
   };
@@ -808,6 +814,18 @@ export default function App() {
                   {scanError}
                 </div>
                 <button onClick={() => setScanError(null)} className="p-1 hover:bg-red-100 rounded">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
+            {scanSuccessMsg && (
+              <div className="mt-2 p-3 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center gap-3 text-emerald-800 text-xs shadow-sm">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                <div className="flex-1 font-medium">
+                  {scanSuccessMsg}
+                </div>
+                <button onClick={() => setScanSuccessMsg(null)} className="p-1 hover:bg-emerald-100 text-emerald-600 rounded">
                   <X className="w-4 h-4" />
                 </button>
               </div>

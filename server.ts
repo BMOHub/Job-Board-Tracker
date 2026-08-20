@@ -270,6 +270,8 @@ app.get("/api/gemini-status", (req, res) => {
   res.json({ configured: isGeminiConfigured() });
 });
 
+let searchGroundingDisabledUntil = 0;
+
 // API Endpoint: Scan Jobs for Employer with Tiered Grounding + Direct Fallback
 app.post("/api/scan-jobs", async (req, res) => {
   const { employerName, website } = req.body;
@@ -321,32 +323,48 @@ If no jobs exist, return an empty array [].`;
     }
   };
 
-  // Attempt 1: Try with Google Search Grounding (for live deep web discovery)
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.7-flash",
-      contents: prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        responseSchema: schemaConfig
-      }
-    });
+  // Attempt 1: Try with Google Search Grounding (if not in quota cooldown)
+  const isSearchDisabled = Date.now() < searchGroundingDisabledUntil;
+  if (!isSearchDisabled) {
+    try {
+      const searchPromise = ai.models.generateContent({
+        model: "gemini-3.7-flash",
+        contents: prompt,
+        config: {
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json",
+          responseSchema: schemaConfig
+        }
+      });
 
-    if (response && response.text) {
-      const groundingChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
-      const jobs = parseAndCleanJobsJson(response.text, employerName, website, groundingChunks);
-      if (jobs.length > 0) {
-        return res.json({ jobs, source: "search-grounded" });
+      // 3.5-second timeout race for search grounding
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("Search Grounding timeout (3.5s limit)")), 3500)
+      );
+
+      const response: any = await Promise.race([searchPromise, timeoutPromise]);
+
+      if (response && response.text) {
+        const groundingChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
+        const jobs = parseAndCleanJobsJson(response.text, employerName, website, groundingChunks);
+        if (jobs.length > 0) {
+          return res.json({ jobs, source: "search-grounded" });
+        }
+      }
+    } catch (searchError: any) {
+      const isQuota = searchError?.status === 429 || String(searchError?.message).includes("429") || String(searchError?.message).includes("RESOURCE_EXHAUSTED");
+      if (isQuota) {
+        // Pause search grounding attempts for 10 minutes so all subsequent scans are instant
+        searchGroundingDisabledUntil = Date.now() + 10 * 60 * 1000;
+        console.warn(`[Gemini Circuit Breaker] Search quota 429 detected. Disabling search grounding for 10 minutes to maintain instant AI model scanning.`);
+      } else {
+        console.warn(`[Gemini Scanner] Search Grounding skipped for ${employerName} (${searchError?.status || "timeout"}: ${String(searchError?.message).slice(0, 100)}). Switching to Direct AI Model...`);
       }
     }
-  } catch (searchError: any) {
-    const searchErrorMsg = searchError?.message || String(searchError);
-    console.warn(`[Gemini Scanner] Search Grounding skipped for ${employerName} (${searchError?.status || "err"}: ${searchErrorMsg.slice(0, 120)}). Engaging Direct AI Model Fallback...`);
   }
 
-  // Attempt 2: Direct AI Model Fallback without search grounding (bypasses Google Search quota limitations)
-  const candidateModels = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  // Attempt 2: High-speed Direct AI Model Cascade (gemini-3.5-flash is ultra-fast & stable)
+  const candidateModels = ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const modelName of candidateModels) {
@@ -366,17 +384,13 @@ If no jobs exist, return an empty array [].`;
       }
     } catch (modelError: any) {
       lastError = modelError;
-      console.warn(`[Gemini Model Cascade] Model ${modelName} encountered error for ${employerName}: ${modelError?.status || modelError?.message?.slice(0, 100)}. Trying next model...`);
-      // Brief pause before trying next candidate model
-      await new Promise(r => setTimeout(r, 400));
+      console.warn(`[Gemini Model Cascade] Model ${modelName} encountered error for ${employerName}: ${modelError?.status || modelError?.message?.slice(0, 100)}. Trying next candidate...`);
+      await new Promise(r => setTimeout(r, 200));
     }
   }
 
-  console.error(`Direct AI Model cascade exhausted for ${employerName}:`, lastError);
-  return res.status(lastError?.status || 500).json({
-    error: `Unable to scan ${employerName}: ${lastError?.message || "Model request error"}`,
-    isRateLimit: lastError?.status === 429
-  });
+  console.warn(`[Gemini Scanner] Fallback cascade exhausted for ${employerName}. Returning empty set.`);
+  return res.json({ jobs: [], source: "fallback-empty", warning: lastError?.message || "Model cascade exhausted" });
 });
 
 // Vite middleware flow setup

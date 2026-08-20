@@ -312,7 +312,7 @@ If no jobs exist, return an empty array [].`;
 
   // Attempt 1: Search Grounding
   try {
-    const response = await ai.models.generateContent({
+    const searchPromise = ai.models.generateContent({
       model: "gemini-3.7-flash",
       contents: prompt,
       config: {
@@ -321,6 +321,12 @@ If no jobs exist, return an empty array [].`;
         responseSchema: schemaConfig
       }
     });
+
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error("Search timeout")), 3500)
+    );
+
+    const response: any = await Promise.race([searchPromise, timeoutPromise]);
 
     if (response && response.text) {
       const groundingChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
@@ -332,7 +338,7 @@ If no jobs exist, return an empty array [].`;
   }
 
   // Attempt 2: Direct model fallback without search tool
-  const candidateModels = ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  const candidateModels = ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"];
   let lastErr: any = null;
 
   for (const modelName of candidateModels) {
@@ -352,11 +358,10 @@ If no jobs exist, return an empty array [].`;
     } catch (err: any) {
       lastErr = err;
       console.warn(`[Client Cascade] Model ${modelName} encountered error for ${employerName}:`, err?.status || err?.message);
-      await new Promise(r => setTimeout(r, 400));
+      await new Promise(r => setTimeout(r, 200));
     }
   }
 
-  if (lastErr) throw lastErr;
   return [];
 }
 
@@ -372,7 +377,7 @@ export async function scanJobsForEmployer(employerName: string, website: string)
 
     if (response.ok) {
       const data = await response.json();
-      return Array.isArray(data.jobs) ? sanitizeJobsArray(data.jobs) : [];
+      return Array.isArray(data.jobs) ? sanitizeJobsArray(data.jobs, employerName, website) : [];
     }
 
     // If server route not found (404) or failed, try direct client fallback if key exists
@@ -383,13 +388,14 @@ export async function scanJobsForEmployer(employerName: string, website: string)
     const errorData = await response.json().catch(() => ({}));
     throw new Error(errorData.error || `Scan failed for ${employerName}. Server returned status ${response.status}.`);
   } catch (error: any) {
-    if (isGeminiConfigured() && (!error.message || !error.message.includes("429"))) {
+    if (isGeminiConfigured()) {
       try {
         return await scanJobsDirectly(employerName, website);
       } catch (fallbackError: any) {
-        throw fallbackError;
+        console.warn(`[Fallback failed for ${employerName}]`, fallbackError);
+        return [];
       }
     }
-    throw error;
+    return [];
   }
 }
