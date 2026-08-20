@@ -333,37 +333,39 @@ export default function App() {
           const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
           let employerNewJobs = 0;
           
+          // Get existing postings for this employer to prevent duplicate titles
+          const existingDocs = await getDocs(query(
+            collection(db, 'jobPostings'), 
+            where('employerId', '==', employer.id)
+          ));
+          
+          const existingTitles = new Set(
+            existingDocs.docs.map(d => (d.data().title || '').trim().toLowerCase())
+          );
+          
           for (const job of foundJobs) {
             if (abortControllerRef.current) break;
+            const cleanTitle = (job.title || '').trim();
+            const normalizedTitle = cleanTitle.toLowerCase();
+            if (!normalizedTitle) continue;
 
-            // Duplicate check: URL or (Title + Employer)
-            const qUrl = query(collection(db, 'jobPostings'), where('url', '==', job.url));
-            const qTitle = query(collection(db, 'jobPostings'), 
-              where('employerId', '==', employer.id),
-              where('title', '==', job.title)
-            );
-            
-            const [existingUrl, existingTitle] = await Promise.all([
-              getDocs(qUrl),
-              getDocs(qTitle)
-            ]);
-            
-            if (existingUrl.empty && existingTitle.empty) {
+            if (!existingTitles.has(normalizedTitle)) {
               const postedDate = job.postedDate ? new Date(job.postedDate) : null;
               const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
               await addDoc(collection(db, 'jobPostings'), {
                 employerId: employer.id,
                 employerName: employer.name,
-                title: job.title,
+                title: cleanTitle,
                 location: job.location || 'Philadelphia, PA',
                 city: job.city || 'Philadelphia',
                 roleType: job.roleType || 'Full-time',
-                url: job.url,
+                url: job.url || employer.website || 'https://www.google.com/search?q=' + encodeURIComponent(employer.name + ' careers philadelphia'),
                 postedDate: validPostedDate,
                 foundDate: serverTimestamp(),
                 description: job.description || ''
               });
+              existingTitles.add(normalizedTitle);
               employerNewJobs++;
               totalNewJobsAdded++;
             }
@@ -429,36 +431,39 @@ export default function App() {
       try {
         const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
         
+        // Get existing postings for this employer to prevent duplicate titles
+        const existingDocs = await getDocs(query(
+          collection(db, 'jobPostings'), 
+          where('employerId', '==', employer.id)
+        ));
+        
+        const existingTitles = new Set(
+          existingDocs.docs.map(d => (d.data().title || '').trim().toLowerCase())
+        );
+
         for (const job of foundJobs) {
           if (abortControllerRef.current) break;
+          const cleanTitle = (job.title || '').trim();
+          const normalizedTitle = cleanTitle.toLowerCase();
+          if (!normalizedTitle) continue;
 
-          const qUrl = query(collection(db, 'jobPostings'), where('url', '==', job.url));
-          const qTitle = query(collection(db, 'jobPostings'), 
-            where('employerId', '==', employer.id),
-            where('title', '==', job.title)
-          );
-          
-          const [existingUrl, existingTitle] = await Promise.all([
-            getDocs(qUrl),
-            getDocs(qTitle)
-          ]);
-          
-          if (existingUrl.empty && existingTitle.empty) {
+          if (!existingTitles.has(normalizedTitle)) {
             const postedDate = job.postedDate ? new Date(job.postedDate) : null;
             const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
             await addDoc(collection(db, 'jobPostings'), {
               employerId: employer.id,
               employerName: employer.name,
-              title: job.title,
+              title: cleanTitle,
               location: job.location || 'Philadelphia, PA',
               city: job.city || 'Philadelphia',
               roleType: job.roleType || 'Full-time',
-              url: job.url,
+              url: job.url || employer.website || 'https://www.google.com/search?q=' + encodeURIComponent(employer.name + ' careers philadelphia'),
               postedDate: validPostedDate,
               foundDate: serverTimestamp(),
               description: job.description || ''
             });
+            existingTitles.add(normalizedTitle);
             newJobsCount++;
           }
         }
