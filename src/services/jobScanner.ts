@@ -268,14 +268,18 @@ export function parseAndCleanJobsJson(
 }
 
 // Direct client fallback if running in purely static environment (e.g. Vercel without Node server)
-async function scanJobsDirectly(employerName: string, website: string): Promise<ScannedJob[]> {
+async function scanJobsDirectly(employerName: string, website: string, existingTitles?: string[]): Promise<ScannedJob[]> {
   const ai = getClientAI();
   if (!ai) {
     throw new Error("Gemini API Key is not configured. Please set GEMINI_API_KEY or VITE_GEMINI_API_KEY.");
   }
 
+  const existingTitlesStr = Array.isArray(existingTitles) && existingTitles.length > 0
+    ? `\nCURRENTLY KNOWN POSITIONS ON BOARD: ${existingTitles.slice(0, 10).join("; ")}. Actively find ADDITIONAL or NEW open positions for this employer that are not already listed above.`
+    : "";
+
   const prompt = `You are an expert Philadelphia workforce scout. Find active, realistic job openings at "${employerName}" located in the Greater Philadelphia area (Philadelphia, Southeastern PA, Camden/South Jersey).
-Official Reference Website: ${website || "Not provided"}
+Official Reference Website: ${website || "Not provided"}${existingTitlesStr}
 
 CRITICAL DEEP-LINK REQUIREMENTS:
 - Provide the direct career portal or job application URL starting with https:// or http:// (e.g. on Workday, Greenhouse, Lever, Taleo, iCIMS, SmartRecruiters, UKG, BambooHR, ADP, LinkedIn Jobs, or the employer's official career portal: ${website || "careers portal"}).
@@ -338,7 +342,7 @@ If no jobs exist, return an empty array [].`;
   }
 
   // Attempt 2: Direct model fallback without search tool
-  const candidateModels = ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"];
+  const candidateModels = ["gemini-3.7-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
   let lastErr: any = null;
 
   for (const modelName of candidateModels) {
@@ -365,14 +369,14 @@ If no jobs exist, return an empty array [].`;
   return [];
 }
 
-export async function scanJobsForEmployer(employerName: string, website: string): Promise<ScannedJob[]> {
+export async function scanJobsForEmployer(employerName: string, website: string, existingTitles?: string[]): Promise<ScannedJob[]> {
   try {
     const response = await fetch("/api/scan-jobs", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ employerName, website }),
+      body: JSON.stringify({ employerName, website, existingTitles }),
     });
 
     if (response.ok) {
@@ -382,7 +386,7 @@ export async function scanJobsForEmployer(employerName: string, website: string)
 
     // If server route not found (404) or failed, try direct client fallback if key exists
     if (response.status === 404 && isGeminiConfigured()) {
-      return await scanJobsDirectly(employerName, website);
+      return await scanJobsDirectly(employerName, website, existingTitles);
     }
 
     const errorData = await response.json().catch(() => ({}));
@@ -390,7 +394,7 @@ export async function scanJobsForEmployer(employerName: string, website: string)
   } catch (error: any) {
     if (isGeminiConfigured()) {
       try {
-        return await scanJobsDirectly(employerName, website);
+        return await scanJobsDirectly(employerName, website, existingTitles);
       } catch (fallbackError: any) {
         console.warn(`[Fallback failed for ${employerName}]`, fallbackError);
         return [];

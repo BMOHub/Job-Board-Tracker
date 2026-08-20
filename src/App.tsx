@@ -83,7 +83,7 @@ export default function App() {
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [selectedRoleType, setSelectedRoleType] = useState('All');
   const [selectedCity, setSelectedCity] = useState('All');
-  const [selectedTimeframe, setSelectedTimeframe] = useState<'7d' | '14d' | '30d' | 'all'>('30d');
+  const [selectedTimeframe, setSelectedTimeframe] = useState<'7d' | '14d' | '30d' | 'all'>('all');
   const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'employer' | 'title'>('newest');
   const [activeTab, setActiveTab] = useState<'jobs' | 'employers'>('jobs');
   const [isScanning, setIsScanning] = useState(false);
@@ -330,18 +330,22 @@ export default function App() {
 
       while (!success && retryCount < 2 && !abortControllerRef.current) {
         try {
-          const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
-          let employerNewJobs = 0;
-          
-          // Get existing postings for this employer to prevent duplicate titles
+          // Get existing postings for this employer to track existing titles and update them
           const existingDocs = await getDocs(query(
             collection(db, 'jobPostings'), 
             where('employerId', '==', employer.id)
           ));
           
-          const existingTitles = new Set(
-            existingDocs.docs.map(d => (d.data().title || '').trim().toLowerCase())
-          );
+          const existingDocsByTitle = new Map<string, any>();
+          existingDocs.docs.forEach(d => {
+            const t = (d.data().title || '').trim().toLowerCase();
+            if (t) existingDocsByTitle.set(t, d);
+          });
+          
+          const existingTitleList = Array.from(existingDocsByTitle.keys());
+          const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+          let employerNewJobs = 0;
+          let employerRefreshedJobs = 0;
           
           for (const job of foundJobs) {
             if (abortControllerRef.current) break;
@@ -349,10 +353,10 @@ export default function App() {
             const normalizedTitle = cleanTitle.toLowerCase();
             if (!normalizedTitle) continue;
 
-            if (!existingTitles.has(normalizedTitle)) {
-              const postedDate = job.postedDate ? new Date(job.postedDate) : null;
-              const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
+            const postedDate = job.postedDate ? new Date(job.postedDate) : null;
+            const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
+            if (!existingDocsByTitle.has(normalizedTitle)) {
               await addDoc(collection(db, 'jobPostings'), {
                 employerId: employer.id,
                 employerName: employer.name,
@@ -365,9 +369,20 @@ export default function App() {
                 foundDate: serverTimestamp(),
                 description: job.description || ''
               });
-              existingTitles.add(normalizedTitle);
+              existingDocsByTitle.set(normalizedTitle, true);
               employerNewJobs++;
               totalNewJobsAdded++;
+            } else {
+              // Existing posting is re-verified active
+              const existingDocObj = existingDocsByTitle.get(normalizedTitle);
+              if (existingDocObj && existingDocObj.id) {
+                await setDoc(doc(db, 'jobPostings', existingDocObj.id), {
+                  foundDate: serverTimestamp(),
+                  url: job.url || existingDocObj.data().url || employer.website,
+                  description: job.description || existingDocObj.data().description || ''
+                }, { merge: true });
+              }
+              employerRefreshedJobs++;
             }
           }
 
@@ -409,7 +424,7 @@ export default function App() {
     setCooldownCountdown(null);
     setScanError(null);
     if (!abortControllerRef.current) {
-      setScanSuccessMsg(`Scan complete: Synced ${targetEmployers.length} partner employer(s). Added ${totalNewJobsAdded} new job posting(s).`);
+      setScanSuccessMsg(`Scan complete: Synced ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
     }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
@@ -426,20 +441,26 @@ export default function App() {
     let retryCount = 0;
     let success = false;
     let newJobsCount = 0;
+    let refreshedJobsCount = 0;
+    let totalFound = 0;
 
     while (!success && retryCount < 2 && !abortControllerRef.current) {
       try {
-        const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '');
-        
-        // Get existing postings for this employer to prevent duplicate titles
+        // Get existing postings for this employer to track existing titles and update them
         const existingDocs = await getDocs(query(
           collection(db, 'jobPostings'), 
           where('employerId', '==', employer.id)
         ));
         
-        const existingTitles = new Set(
-          existingDocs.docs.map(d => (d.data().title || '').trim().toLowerCase())
-        );
+        const existingDocsByTitle = new Map<string, any>();
+        existingDocs.docs.forEach(d => {
+          const t = (d.data().title || '').trim().toLowerCase();
+          if (t) existingDocsByTitle.set(t, d);
+        });
+
+        const existingTitleList = Array.from(existingDocsByTitle.keys());
+        const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+        totalFound = foundJobs.length;
 
         for (const job of foundJobs) {
           if (abortControllerRef.current) break;
@@ -447,10 +468,10 @@ export default function App() {
           const normalizedTitle = cleanTitle.toLowerCase();
           if (!normalizedTitle) continue;
 
-          if (!existingTitles.has(normalizedTitle)) {
-            const postedDate = job.postedDate ? new Date(job.postedDate) : null;
-            const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
+          const postedDate = job.postedDate ? new Date(job.postedDate) : null;
+          const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
+          if (!existingDocsByTitle.has(normalizedTitle)) {
             await addDoc(collection(db, 'jobPostings'), {
               employerId: employer.id,
               employerName: employer.name,
@@ -463,8 +484,19 @@ export default function App() {
               foundDate: serverTimestamp(),
               description: job.description || ''
             });
-            existingTitles.add(normalizedTitle);
+            existingDocsByTitle.set(normalizedTitle, true);
             newJobsCount++;
+          } else {
+            // Existing position is verified active & refreshed
+            const existingDocObj = existingDocsByTitle.get(normalizedTitle);
+            if (existingDocObj && existingDocObj.id) {
+              await setDoc(doc(db, 'jobPostings', existingDocObj.id), {
+                foundDate: serverTimestamp(),
+                url: job.url || existingDocObj.data().url || employer.website,
+                description: job.description || existingDocObj.data().description || ''
+              }, { merge: true });
+            }
+            refreshedJobsCount++;
           }
         }
 
@@ -498,7 +530,15 @@ export default function App() {
 
     setCooldownCountdown(null);
     if (success && !abortControllerRef.current) {
-      setScanSuccessMsg(`Scan complete for ${employer.name}: Added ${newJobsCount} new job posting(s).`);
+      if (newJobsCount > 0 && refreshedJobsCount > 0) {
+        setScanSuccessMsg(`Scan complete for ${employer.name}: Discovered ${newJobsCount} new opening(s) and re-verified ${refreshedJobsCount} existing position(s).`);
+      } else if (newJobsCount > 0) {
+        setScanSuccessMsg(`Scan complete for ${employer.name}: Added ${newJobsCount} newly discovered job posting(s).`);
+      } else if (refreshedJobsCount > 0) {
+        setScanSuccessMsg(`Scan complete for ${employer.name}: All ${refreshedJobsCount} existing position(s) are active and verified up to date.`);
+      } else {
+        setScanSuccessMsg(`Scan completed for ${employer.name}: 0 active listings found at this time.`);
+      }
     }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
@@ -1004,10 +1044,26 @@ export default function App() {
                 <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-4">
                   <Search className="w-8 h-8 text-slate-300" />
                 </div>
-                <h3 className="text-lg font-semibold text-slate-900">No jobs found</h3>
-                <p className="text-slate-500 max-w-xs mx-auto mt-1">
-                  Try adjusting your search or category filters, or run a new scan.
+                <h3 className="text-lg font-semibold text-slate-900">No matching jobs found</h3>
+                <p className="text-slate-500 max-w-sm mx-auto mt-1 mb-4 text-sm">
+                  {jobs.length > 0 
+                    ? `There are ${jobs.length} total active postings in the database, but none match the current filter criteria.` 
+                    : "No job postings in the database yet. Click 'Scan Outdated' or 'Scan All' above to discover current openings."}
                 </p>
+                {(searchTerm || selectedCategory !== 'All' || selectedRoleType !== 'All' || selectedCity !== 'All' || selectedTimeframe !== 'all') && (
+                  <button
+                    onClick={() => {
+                      setSearchTerm('');
+                      setSelectedCategory('All');
+                      setSelectedRoleType('All');
+                      setSelectedCity('All');
+                      setSelectedTimeframe('all');
+                    }}
+                    className="px-4 py-2 bg-blue-50 text-blue-600 hover:bg-blue-100 font-semibold text-xs rounded-xl transition-all cursor-pointer inline-flex items-center gap-1.5"
+                  >
+                    <span>Reset All Filters</span>
+                  </button>
+                )}
               </div>
             ) : (
               <div className="grid grid-cols-1 gap-4">

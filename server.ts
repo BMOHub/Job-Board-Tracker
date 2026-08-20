@@ -274,7 +274,7 @@ let searchGroundingDisabledUntil = 0;
 
 // API Endpoint: Scan Jobs for Employer with Tiered Grounding + Direct Fallback
 app.post("/api/scan-jobs", async (req, res) => {
-  const { employerName, website } = req.body;
+  const { employerName, website, existingTitles } = req.body;
 
   if (!employerName) {
     return res.status(400).json({ error: "Employer Name is required." });
@@ -287,8 +287,12 @@ app.post("/api/scan-jobs", async (req, res) => {
     });
   }
 
+  const existingTitlesStr = Array.isArray(existingTitles) && existingTitles.length > 0
+    ? `\nCURRENTLY KNOWN POSITIONS ON BOARD: ${existingTitles.slice(0, 10).join("; ")}. Actively find ADDITIONAL or NEW open positions for this employer that are not already listed above.`
+    : "";
+
   const prompt = `You are an expert Philadelphia workforce scout. Find active, realistic job openings at "${employerName}" located in the Greater Philadelphia area (Philadelphia, Southeastern PA, Camden/South Jersey).
-Official Reference Website: ${website || "Not provided"}
+Official Reference Website: ${website || "Not provided"}${existingTitlesStr}
 
 CRITICAL DEEP-LINK REQUIREMENTS:
 - Provide the direct career portal or job application URL starting with https:// or http:// (e.g. on Workday, Greenhouse, Lever, Taleo, iCIMS, SmartRecruiters, UKG, BambooHR, ADP, LinkedIn Jobs, or the employer's official career portal: ${website || "careers portal"}).
@@ -363,8 +367,8 @@ If no jobs exist, return an empty array [].`;
     }
   }
 
-  // Attempt 2: High-speed Direct AI Model Cascade (gemini-3.5-flash is ultra-fast & stable)
-  const candidateModels = ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"];
+  // Attempt 2: High-speed Direct AI Model Cascade
+  const candidateModels = ["gemini-3.7-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const modelName of candidateModels) {
