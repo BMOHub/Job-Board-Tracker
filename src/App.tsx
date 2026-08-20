@@ -296,7 +296,7 @@ export default function App() {
       if (mode === 'category') {
         setScanError(`No employer partners found under "${categoryName || selectedCategory}".`);
       } else {
-        setScanError("All employer partners have already been scanned within the past 24 hours. You can click 'Scan All (44)' or select a specific category to scan.");
+        setScanSuccessMsg(`All ${employers.length} employer partners are current and up-to-date (scanned within the last 24 hours). Click 'Scan All' anytime to force a full re-scan.`);
       }
       return;
     }
