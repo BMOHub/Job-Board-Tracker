@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   DEFAULT_GEMINI_MODEL,
+  describeGeminiError,
   extractLikelyCareerLinks,
   parseEvidenceBackedJobs,
   type SourceDocument,
@@ -9,6 +10,27 @@ import {
 
 test("uses a stable current Gemini model by default", () => {
   assert.equal(DEFAULT_GEMINI_MODEL, "gemini-3.6-flash");
+});
+
+test("turns Gemini authentication and quota failures into actionable safe messages", () => {
+  assert.match(
+    describeGeminiError({ status: 401, message: "API key not valid" }),
+    /Replace GEMINI_API_KEY in Vercel/,
+  );
+  assert.match(
+    describeGeminiError({ status: 429, message: "RESOURCE_EXHAUSTED" }),
+    /quota or rate limits/i,
+  );
+});
+
+test("reports an unavailable configured model without returning the raw SDK error", () => {
+  const message = describeGeminiError({
+    status: 404,
+    message: "models/gemini-3.6-flash is not found for API version v1beta; internal trace secret-123",
+  });
+
+  assert.match(message, /gemini-3.6-flash is unavailable/i);
+  assert.doesNotMatch(message, /secret-123/);
 });
 
 const source: SourceDocument = {

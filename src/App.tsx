@@ -320,6 +320,7 @@ export default function App() {
 
     let scanFailedCount = 0;
     let totalNewJobsAdded = 0;
+    let lastScanFailure = '';
 
     for (let i = 0; i < targetEmployers.length; i++) {
       if (abortControllerRef.current) break;
@@ -421,7 +422,8 @@ export default function App() {
 
           console.error(`Error scanning ${employer.name}:`, error);
           scanFailedCount++;
-          setScanError(`Scan notice: ${employer.name} had a temporary timeout. Continuing with remaining partners...`);
+          lastScanFailure = errMsg;
+          setScanError(`Scan notice: ${employer.name}: ${errMsg} Continuing with remaining partners...`);
           break;
         }
       }
@@ -435,7 +437,7 @@ export default function App() {
     setCooldownCountdown(null);
     if (!abortControllerRef.current) {
       setScanError(scanFailedCount > 0
-        ? `${scanFailedCount} employer scan(s) failed. Those employers were not marked as successfully scanned; try them again individually.`
+        ? `${scanFailedCount} employer scan(s) failed. Last error: ${lastScanFailure}`
         : null);
       const successfulScans = targetEmployers.length - scanFailedCount;
       setScanSuccessMsg(`Scan complete: Synced ${successfulScans} of ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);

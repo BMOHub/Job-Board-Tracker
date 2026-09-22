@@ -31,12 +31,12 @@ const READER_TIMEOUT_MS = 12_000;
 const ATS_HOST_PATTERN = /(?:^|\.)(?:myworkdayjobs\.com|greenhouse\.io|lever\.co|taleo\.net|oraclecloud\.com|icims\.com|smartrecruiters\.com|ultipro\.com|ukg\.com|bamboohr\.com|adp\.com|jobvite\.com|paylocity\.com|dayforcehcm\.com|successfactors\.com|sapsf\.com)$/i;
 
 export function hasGeminiApiKey(): boolean {
-  const key = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || "";
-  return Boolean(key && key !== "MY_GEMINI_API_KEY" && key !== "MY_VITE_GEMINI_API_KEY");
+  const key = process.env.GEMINI_API_KEY || "";
+  return Boolean(key && key !== "MY_GEMINI_API_KEY");
 }
 
 function getAIClient(): GoogleGenAI | null {
-  const key = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || "";
+  const key = process.env.GEMINI_API_KEY || "";
   if (!hasGeminiApiKey()) return null;
 
   try {
@@ -45,6 +45,43 @@ function getAIClient(): GoogleGenAI | null {
     console.error("Failed to initialize GoogleGenAI:", error);
     return null;
   }
+}
+
+/** Converts upstream SDK failures into actionable messages without exposing secrets. */
+export function describeGeminiError(error: unknown): string {
+  const candidate = error as { message?: unknown; status?: unknown; code?: unknown } | null;
+  const rawMessage = String(candidate?.message || "");
+  const normalized = rawMessage.toLowerCase();
+  const status = Number(candidate?.status || candidate?.code || 0) || undefined;
+
+  if (
+    status === 401 ||
+    /api key not valid|invalid api key|unauthenticated|authentication credential/.test(normalized)
+  ) {
+    return "Gemini rejected the configured API key. Replace GEMINI_API_KEY in Vercel with a current Google AI Studio key, then redeploy.";
+  }
+  if (
+    status === 403 ||
+    /permission denied|permission_denied|access restricted|not authorized/.test(normalized)
+  ) {
+    return "Gemini denied access for this API key. Confirm the key's Google Cloud project has Gemini API access and billing or free-tier quota, then redeploy.";
+  }
+  if (status === 429 || /resource_exhausted|quota|rate limit|too many requests/.test(normalized)) {
+    return "Gemini quota or rate limits were reached. Wait briefly or review the Google AI Studio project's usage and billing.";
+  }
+  if (status === 404 || /model.+not found|not found.+model|not supported for generatecontent/.test(normalized)) {
+    return `Gemini model ${MODEL} is unavailable to this API key. Set GEMINI_MODEL to an available stable Flash model in Vercel, then redeploy.`;
+  }
+  if (/timeout|timed out|deadline|aborterror/.test(normalized)) {
+    return "The Gemini request timed out before the scan completed. Please retry this employer.";
+  }
+  if (status === 400) {
+    return `Gemini rejected the scan request (400) for model ${MODEL}. Check the Vercel function logs for the upstream validation message.`;
+  }
+
+  return status
+    ? `Gemini could not complete the scan (upstream status ${status}). Check the Vercel function logs for details.`
+    : "Gemini could not complete the scan. Check the Vercel function logs for details.";
 }
 
 function normalizeHttpUrl(value: unknown, baseUrl?: string): string | null {
@@ -438,7 +475,7 @@ export async function scanJobsForEmployer(
       jobs: [],
       source: "no-jobs-found",
       authoritative: false,
-      error: "The job scan service could not complete this employer. Please try again shortly.",
+      error: describeGeminiError(lastError),
     };
   }
 
