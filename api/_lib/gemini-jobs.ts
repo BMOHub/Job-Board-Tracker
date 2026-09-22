@@ -40,7 +40,7 @@ function findBestJobUrl(
 ): string {
   let url = (rawUrl || "").trim();
 
-  // Resolve relative links (e.g. "/careers/job/123") into full clickable URLs
+  // 1. Resolve relative paths (/careers/job/123 -> https://company.com/careers/job/123)
   if (url && !url.startsWith("http://") && !url.startsWith("https://")) {
     try {
       const baseUrl = website && website.startsWith("http") ? website : `https://${website}`;
@@ -50,18 +50,26 @@ function findBestJobUrl(
     }
   }
 
+  // 2. Determine if a URL is generic (bare homepage or plain /careers with no parameters/IDs)
   const isGenericOrHomepage = (u: string): boolean => {
     if (!u || !u.startsWith("http")) return true;
     try {
       const parsed = new URL(u);
       const pathname = parsed.pathname.toLowerCase().replace(/\/$/, "");
+
+      // If URL contains query parameters or anchor hashes (e.g. ?id=123 or #job-456), treat as deep link
+      if (parsed.search || parsed.hash) return false;
+
       if (!pathname || pathname === "") return true;
+
       const genericPaths = [
         "/careers", "/career", "/jobs", "/job", "/work-with-us",
         "/join-us", "/about/careers", "/pages/careers", "/en-us",
         "/about", "/about-us", "/home", "/employment"
       ];
-      if (genericPaths.includes(pathname) && !parsed.search && !parsed.hash) return true;
+
+      if (genericPaths.includes(pathname)) return true;
+
       if (website) {
         try {
           const empParsed = new URL(website);
@@ -74,6 +82,7 @@ function findBestJobUrl(
     }
   };
 
+  // 3. Grounding chunk matching for ATS domains
   if (Array.isArray(groundingChunks) && groundingChunks.length > 0) {
     const validUris = groundingChunks
       .map((c) => ({ uri: c?.web?.uri || "", title: c?.web?.title || "" }))
@@ -92,16 +101,9 @@ function findBestJobUrl(
       const matchesTitle = titleWords.some((w) => chunkTitle.includes(w) || chunkUri.includes(w));
       if (isAtsLink && matchesTitle) return chunk.uri;
     }
-    if (isGenericOrHomepage(url)) {
-      for (const chunk of validUris) {
-        if (!isGenericOrHomepage(chunk.uri)) {
-          const chunkTitle = chunk.title.toLowerCase();
-          if (titleWords.some((w) => chunkTitle.includes(w))) return chunk.uri;
-        }
-      }
-    }
   }
 
+  // 4. Return specific URL if valid; fall back to website or search query
   if (!isGenericOrHomepage(url)) return url;
   return website && website.startsWith("http") ? website : `https://www.google.com/search?q=${encodeURIComponent(employerName + " " + jobTitle + " jobs philadelphia")}`;
 }
@@ -215,29 +217,28 @@ export async function scanJobsForEmployer(employerName: string, website: string,
     ? `\nCURRENTLY KNOWN POSITIONS ON BOARD: ${existingTitlesArray.slice(0, 10).join("; ")}. Actively find ADDITIONAL or NEW open positions for this employer that are not already listed above.`
     : "";
 
-  // 1. Fetch live markdown text from target website using Jina Reader
   let liveWebText = "";
   if (website && website.startsWith("http")) {
     try {
-      const jinaUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){encodeURIComponent(website.trim())}`;
+      const jinaUrl = `https://r.jina.ai/${encodeURIComponent(website.trim())}`;
       const jinaRes = await fetch(jinaUrl, { headers: { "Accept": "text/markdown" } });
       if (jinaRes.ok) {
         const rawText = await jinaRes.text();
-        liveWebText = rawText.slice(0, 8000); // Cap at 8,000 characters
+        liveWebText = rawText.slice(0, 8000);
       }
     } catch (e) {
       console.warn("[gemini-jobs] Jina fetch failed, falling back to AI prompt search.");
     }
   }
 
-  const prompt = `You are an expert Philadelphia workforce scout. Find active job openings at "${employerName}" located in Greater Philadelphia.
+  const prompt = `You are an expert workforce crawler extracting active job postings for "${employerName}" located in Greater Philadelphia.
 
-Analyze the raw web content below to extract active job listings.
+Extract individual active job listings from the raw web content below.
 
-CRITICAL DIRECT LINK REQUIREMENTS:
-- Look specifically for the specific job detail/application link associated with each job title in the markdown text.
-- If a relative URL is found (e.g. "/careers/detail?id=1234" or "job/567"), return that exact string in the "url" field.
-- Do NOT default to the main website homepage if a more specific job or application link exists in the text.
+URL EXTRACTION RULES:
+- Inspect every Markdown link [Job Title](href) or HTML anchor tag in the content.
+- If a direct job URL exists (e.g., "[https://company.greenhouse.io/job/123](https://company.greenhouse.io/job/123)", "/careers/detail?id=99", or "[myworkdayjobs.com/](https://myworkdayjobs.com/)..."), extract that EXACT string into the "url" property.
+- Only return the base career page URL if NO job-specific link or relative link exists for that role.
 
 Official Reference Website: ${website || "Not provided"}${existingTitlesStr}
 
@@ -246,9 +247,9 @@ ${liveWebText || "No live content retrieved."}
 
 Return a JSON array of 3 to 8 openings.
 Each object MUST contain:
-- "title": Specific Job Title
-- "url": Exact specific posting URL or relative link extracted from the text
-- "location": Full location string (e.g., "Philadelphia, PA")
+- "title": Job title
+- "url": Direct application/posting URL or relative link
+- "location": Location (e.g., "Philadelphia, PA")
 - "city": City name (e.g., "Philadelphia")
 - "roleType": "Full-time", "Part-time", "Contract", or "Internship"
 - "postedDate": Date posted (YYYY-MM-DD)
@@ -274,7 +275,6 @@ Each object MUST contain:
   const primaryModel = "gemini-2.0-flash";
   let lastError: any = null;
 
-  // 2. Primary Structured JSON Call with Scraped Page Content
   try {
     const response = await ai.models.generateContent({
       model: primaryModel,
@@ -289,7 +289,6 @@ Each object MUST contain:
     lastError = modelError;
   }
 
-  // 3. Google Search Grounded Fallback
   const isSearchDisabled = Date.now() < searchGroundingDisabledUntil;
   if (!isSearchDisabled) {
     try {
@@ -311,7 +310,6 @@ Each object MUST contain:
     }
   }
 
-  // 4. Domain Synthesis Fallback
   const fallbackJobs = generateDomainFallbackJobs(employerName, website, existingTitlesArray);
   if (fallbackJobs.length > 0) return { jobs: fallbackJobs, source: "domain-synthesis" };
 
