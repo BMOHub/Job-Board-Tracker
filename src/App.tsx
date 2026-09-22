@@ -429,9 +429,12 @@ export default function App() {
     }
 
     setCooldownCountdown(null);
-    setScanError(null);
     if (!abortControllerRef.current) {
-      setScanSuccessMsg(`Scan complete: Synced ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
+      setScanError(scanFailedCount > 0
+        ? `${scanFailedCount} employer scan(s) failed. Those employers were not marked as successfully scanned; try them again individually.`
+        : null);
+      const successfulScans = targetEmployers.length - scanFailedCount;
+      setScanSuccessMsg(`Scan complete: Synced ${successfulScans} of ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
     }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
@@ -450,6 +453,7 @@ export default function App() {
     let newJobsCount = 0;
     let refreshedJobsCount = 0;
     let totalFound = 0;
+    let scanWarning: string | undefined;
 
     while (!success && retryCount < 2 && !abortControllerRef.current) {
       try {
@@ -471,6 +475,7 @@ export default function App() {
           .filter(Boolean))];
         const scanResult = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
         const foundJobs = scanResult.jobs;
+        scanWarning = scanResult.warning;
         totalFound = foundJobs.length;
 
         for (const job of foundJobs) {
@@ -547,6 +552,8 @@ export default function App() {
         setScanSuccessMsg(`Scan complete for ${employer.name}: Added ${newJobsCount} newly discovered job posting(s).`);
       } else if (refreshedJobsCount > 0) {
         setScanSuccessMsg(`Scan complete for ${employer.name}: All ${refreshedJobsCount} existing position(s) are active and verified up to date.`);
+      } else if (scanWarning) {
+        setScanSuccessMsg(`Scan completed for ${employer.name}: 0 verified active listings found. ${scanWarning}`);
       } else {
         setScanSuccessMsg(`Scan completed for ${employer.name}: 0 active listings found at this time.`);
       }

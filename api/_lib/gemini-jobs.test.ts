@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseEvidenceBackedJobs, type SourceDocument } from "./gemini-jobs.js";
+import {
+  extractLikelyCareerLinks,
+  parseEvidenceBackedJobs,
+  type SourceDocument,
+} from "./gemini-jobs.js";
 
 const source: SourceDocument = {
   url: "https://example.org/careers",
@@ -70,4 +74,32 @@ test("rejects a URL that was not present in the cited source", () => {
   }]), [source]);
 
   assert.deepEqual(jobs, []);
+});
+
+test("discovers official ATS and job-search links without following unrelated links", () => {
+  const links = extractLikelyCareerLinks({
+    url: "https://example.org/careers",
+    text: `
+      [Open Positions in Philadelphia](https://workforcenow.adp.com/recruitment/jobs?client=example)
+      [Search and Apply For Jobs](https://example.org/careers/search-and-apply-jobs)
+      [Benefits](https://example.org/about/benefits)
+      [Instagram](https://instagram.com/example)
+    `,
+  });
+
+  assert.deepEqual(links, [
+    "https://workforcenow.adp.com/recruitment/jobs?client=example",
+    "https://example.org/careers/search-and-apply-jobs",
+  ]);
+});
+
+test("discovers ATS links in raw HTML returned by the reader fallback", () => {
+  const links = extractLikelyCareerLinks({
+    url: "https://example.org/careers",
+    text: '<a class="button" href="https://temple.taleo.net/careersection/jobs/jobsearch.ftl?lang=en">External Candidate</a>',
+  });
+
+  assert.deepEqual(links, [
+    "https://temple.taleo.net/careersection/jobs/jobsearch.ftl?lang=en",
+  ]);
 });

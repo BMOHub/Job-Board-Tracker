@@ -23,9 +23,11 @@ export interface SourceDocument {
   text: string;
 }
 
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const MAX_DOCUMENT_CHARS = 80_000;
+const MAX_SOURCE_DOCUMENTS = 5;
 const READER_TIMEOUT_MS = 12_000;
+const ATS_HOST_PATTERN = /(?:^|\.)(?:myworkdayjobs\.com|greenhouse\.io|lever\.co|taleo\.net|oraclecloud\.com|icims\.com|smartrecruiters\.com|ultipro\.com|ukg\.com|bamboohr\.com|adp\.com|jobvite\.com|paylocity\.com|dayforcehcm\.com|successfactors\.com|sapsf\.com)$/i;
 
 export function hasGeminiApiKey(): boolean {
   const key = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || "";
@@ -94,6 +96,44 @@ function extractDocumentUrls(document: SourceDocument): Set<string> {
   }
 
   return urls;
+}
+
+/** Returns the strongest job-board and ATS links exposed by a careers page. */
+export function extractLikelyCareerLinks(document: SourceDocument): string[] {
+  const scored = new Map<string, number>();
+  const sourceUrl = normalizeHttpUrl(document.url);
+  const sourceHost = sourceUrl ? new URL(sourceUrl).hostname : "";
+
+  const scoreLink = (rawLabel: string, rawUrl: string) => {
+    const label = normalizeEvidence(rawLabel.replace(/<[^>]+>/g, " "));
+    const url = normalizeHttpUrl(rawUrl.replace(/&amp;/gi, "&"), document.url);
+    if (!url || comparableUrl(url) === comparableUrl(document.url)) return;
+
+    const parsed = new URL(url);
+    if (/\.(?:css|js|jpe?g|png|gif|svg|webp|pdf|mp4)$/i.test(parsed.pathname)) return;
+    if (/facebook|instagram|linkedin|twitter|youtube|vimeo|google\.com\/maps/i.test(parsed.hostname + parsed.pathname)) return;
+
+    let score = 0;
+    if (ATS_HOST_PATTERN.test(parsed.hostname)) score += 100;
+    if (/open positions?|current openings?|view all jobs?|search (?:and )?apply|search jobs?|external candidate|career site|apply now/.test(label)) score += 80;
+    if (/\/(?:job|jobs|careers?|employment)(?:\/|$)|careersection|jobsearch|recruitment|view-all-jobs/i.test(parsed.pathname)) score += 45;
+    if (/\/job(?:-invite)?\//i.test(parsed.pathname)) score += 35;
+    if (parsed.hostname === sourceHost) score += 10;
+    if (/how-we-hire|applicant-tips|benefits|diversity|ethics|privacy|talent-community/i.test(parsed.pathname)) score -= 80;
+
+    if (score >= 55) scored.set(url, Math.max(score, scored.get(url) || 0));
+  };
+
+  for (const match of document.text.matchAll(/\[([^\]]*)\]\(([^\s)]+)(?:\s+["'][^"']*["'])?\)/gi)) {
+    scoreLink(match[1], match[2]);
+  }
+  for (const match of document.text.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    scoreLink(match[2], match[1]);
+  }
+
+  return [...scored.entries()]
+    .sort(([, left], [, right]) => right - left)
+    .map(([url]) => url);
 }
 
 function containsClosedEvidence(documentText: string, title: string): boolean {
@@ -197,10 +237,22 @@ async function fetchReadablePage(url: string): Promise<SourceDocument | null> {
   if (!normalized) return null;
 
   try {
-    const response = await fetch(`https://r.jina.ai/${normalized}`, {
-      headers: { Accept: "text/plain" },
+    const readerUrl = `https://r.jina.ai/${normalized}`;
+    let response = await fetch(readerUrl, {
+      headers: {
+        Accept: "text/plain",
+        "X-With-Links-Summary": "all",
+        "X-With-Iframe": "true",
+      },
       signal: AbortSignal.timeout(READER_TIMEOUT_MS),
     });
+    // Some sites reject advanced rendering options even though basic Reader works.
+    if ([400, 401, 422].includes(response.status)) {
+      response = await fetch(readerUrl, {
+        headers: { Accept: "text/plain", "X-Respond-With": "html" },
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+      });
+    }
     if (!response.ok) return null;
 
     const text = (await response.text()).trim();
@@ -218,13 +270,41 @@ async function fetchReadablePage(url: string): Promise<SourceDocument | null> {
   }
 }
 
+async function collectCareerDocuments(root: SourceDocument): Promise<SourceDocument[]> {
+  const documents = [root];
+  const visited = new Set<string>([comparableUrl(root.url)]);
+  let frontier = extractLikelyCareerLinks(root);
+
+  for (let depth = 0; depth < 2 && frontier.length > 0 && documents.length < MAX_SOURCE_DOCUMENTS; depth += 1) {
+    const remaining = MAX_SOURCE_DOCUMENTS - documents.length;
+    const batch = frontier
+      .filter((url) => !visited.has(comparableUrl(url)))
+      .slice(0, Math.min(2, remaining));
+    batch.forEach((url) => visited.add(comparableUrl(url)));
+
+    const fetched = (await Promise.all(batch.map(fetchReadablePage)))
+      .filter((document): document is SourceDocument => Boolean(document));
+    documents.push(...fetched);
+    frontier = fetched
+      .flatMap(extractLikelyCareerLinks)
+      .filter((url) => !visited.has(comparableUrl(url)));
+  }
+
+  return documents;
+}
+
+function fitDocumentToBudget(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  const headLength = Math.floor(budget * 0.6);
+  const tailLength = budget - headLength;
+  return `${text.slice(0, headLength)}\n\n[...middle omitted...]\n\n${text.slice(-tailLength)}`;
+}
+
 function buildExtractionPrompt(employerName: string, documents: SourceDocument[]): string {
-  let remaining = MAX_DOCUMENT_CHARS;
-  const sources = documents.map((document, index) => {
-    const text = document.text.slice(0, remaining);
-    remaining = Math.max(0, remaining - text.length);
-    return `SOURCE ${index + 1}\nSOURCE_URL: ${document.url}\n${text}`;
-  }).filter((source) => source.length > 0).join("\n\n---\n\n");
+  const perDocumentBudget = Math.floor(MAX_DOCUMENT_CHARS / Math.max(1, documents.length));
+  const sources = documents.map((document, index) =>
+    `SOURCE ${index + 1}\nSOURCE_URL: ${document.url}\n${fitDocumentToBudget(document.text, perDocumentBudget)}`,
+  ).join("\n\n---\n\n");
 
   return `Extract currently open jobs for "${employerName}" in Greater Philadelphia from the supplied sources.
 
@@ -317,14 +397,19 @@ export async function scanJobsForEmployer(
   }
 
   let lastWarning = "No evidence-backed open positions were found.";
+  let completedExtraction = false;
+  let lastError: unknown = null;
   const officialDocument = await fetchReadablePage(targetUrl);
   if (officialDocument) {
     try {
-      const jobs = await extractJobs(ai, employerName, [officialDocument]);
+      const documents = await collectCareerDocuments(officialDocument);
+      const jobs = await extractJobs(ai, employerName, documents);
+      completedExtraction = true;
       if (jobs.length > 0) {
         return { jobs, source: "official-page", authoritative: true };
       }
     } catch (error: any) {
+      lastError = error;
       lastWarning = error?.message || "Could not extract jobs from the official page.";
       console.warn(`[Job scanner] Official-page extraction failed for ${employerName}:`, error);
     }
@@ -334,13 +419,26 @@ export async function scanJobsForEmployer(
     const candidateUrls = await discoverCandidateUrls(ai, employerName, targetUrl);
     const candidateDocuments = (await Promise.all(candidateUrls.map(fetchReadablePage)))
       .filter((document): document is SourceDocument => Boolean(document));
-    const jobs = await extractJobs(ai, employerName, candidateDocuments);
-    if (jobs.length > 0) {
-      return { jobs, source: "grounded-pages", authoritative: false };
+    if (candidateDocuments.length > 0) {
+      const jobs = await extractJobs(ai, employerName, candidateDocuments);
+      completedExtraction = true;
+      if (jobs.length > 0) {
+        return { jobs, source: "grounded-pages", authoritative: false };
+      }
     }
   } catch (error: any) {
+    lastError = error;
     lastWarning = error?.message || "Grounded job-page discovery failed.";
     console.warn(`[Job scanner] Grounded discovery failed for ${employerName}:`, error);
+  }
+
+  if (!completedExtraction && lastError) {
+    return {
+      jobs: [],
+      source: "no-jobs-found",
+      authoritative: false,
+      error: "The job scan service could not complete this employer. Please try again shortly.",
+    };
   }
 
   return {
