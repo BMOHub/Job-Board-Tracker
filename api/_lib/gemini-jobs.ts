@@ -38,7 +38,7 @@ function resolveJobUrl(rawUrl: string, baseUrl: string): string {
   let url = (rawUrl || "").trim();
   if (!url) return baseUrl;
 
-  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+  if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("mailto:")) {
     try {
       const base = baseUrl.startsWith("http") ? baseUrl : `https://${baseUrl}`;
       url = new URL(url, base).href;
@@ -108,7 +108,7 @@ function parseAndCleanJobsJson(rawText: string, website = ""): ScannedJob[] {
 }
 
 /**
- * Extracts jobs from scraped Markdown content using Gemini 2.0 Flash.
+ * Extracts real active jobs from scraped Markdown text using Gemini 2.0 Flash.
  */
 async function extractJobsWithGemini(
   ai: GoogleGenAI,
@@ -189,23 +189,27 @@ export async function scanJobsForEmployer(employerName: string, website: string,
     : "";
 
   let targetUrl = (website || "").trim();
+  if (targetUrl && !targetUrl.startsWith("http")) {
+    targetUrl = `https://${targetUrl}`;
+  }
+
   let liveWebText = "";
 
-  // 1. Fetch live markdown text from target website
-  if (targetUrl && targetUrl.startsWith("http")) {
+  // 1. Fetch live page markdown via Jina Reader (unencoded target URL format)
+  if (targetUrl) {
     try {
-      const jinaUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){encodeURIComponent(targetUrl)}`;
+      const jinaUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){targetUrl}`;
       const jinaRes = await fetch(jinaUrl, { headers: { "Accept": "text/markdown" } });
       if (jinaRes.ok) {
         const rawText = await jinaRes.text();
-        liveWebText = rawText.slice(0, 12000);
+        liveWebText = rawText.slice(0, 15000);
       }
     } catch (e) {
-      console.warn("[gemini-jobs] Jina fetch failed for initial URL");
+      console.warn("[gemini-jobs] Jina fetch failed for target URL");
     }
   }
 
-  // 2. Extract jobs from initial URL
+  // 2. Extract jobs from initial page content
   let jobs = await extractJobsWithGemini(ai, employerName, targetUrl, liveWebText, existingTitlesStr);
 
   // 3. If no jobs found on main page, search for a "Careers" or "Join Our Team" link and follow it
@@ -213,10 +217,10 @@ export async function scanJobsForEmployer(employerName: string, website: string,
     const careerSubUrl = findCareerLinkInMarkdown(liveWebText, targetUrl);
     if (careerSubUrl && careerSubUrl !== targetUrl) {
       try {
-        const jinaSubUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){encodeURIComponent(careerSubUrl)}`;
+        const jinaSubUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){careerSubUrl}`;
         const jinaSubRes = await fetch(jinaSubUrl, { headers: { "Accept": "text/markdown" } });
         if (jinaSubRes.ok) {
-          const subPageText = (await jinaSubRes.text()).slice(0, 12000);
+          const subPageText = (await jinaSubRes.text()).slice(0, 15000);
           jobs = await extractJobsWithGemini(ai, employerName, careerSubUrl, subPageText, existingTitlesStr);
         }
       } catch (e) {
@@ -225,6 +229,5 @@ export async function scanJobsForEmployer(employerName: string, website: string,
     }
   }
 
-  // Returns only real scraped jobs (no placeholder/fake roles)
   return { jobs, source: jobs.length > 0 ? "live-scrape" : "no-jobs-found" };
 }
