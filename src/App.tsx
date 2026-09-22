@@ -75,6 +75,9 @@ interface JobPosting {
   description?: string;
 }
 
+const jobIdentity = (title: string, location?: string) =>
+  `${title.trim().toLowerCase()}|${(location || '').trim().toLowerCase()}`;
+
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [employers, setEmployers] = useState<Employer[]>([]);
@@ -336,45 +339,49 @@ export default function App() {
             where('employerId', '==', employer.id)
           ));
           
-          const existingDocsByTitle = new Map<string, any>();
+          const existingDocsByIdentity = new Map<string, any>();
           existingDocs.docs.forEach(d => {
-            const t = (d.data().title || '').trim().toLowerCase();
-            if (t) existingDocsByTitle.set(t, d);
+            const data = d.data();
+            const identity = jobIdentity(data.title || '', data.location);
+            if (data.title?.trim()) existingDocsByIdentity.set(identity, d);
           });
           
-          const existingTitleList = Array.from(existingDocsByTitle.keys());
-          const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+          const existingTitleList = [...new Set(existingDocs.docs
+            .map(d => (d.data().title || '').trim())
+            .filter(Boolean))];
+          const scanResult = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+          const foundJobs = scanResult.jobs;
           let employerNewJobs = 0;
           let employerRefreshedJobs = 0;
           
           for (const job of foundJobs) {
             if (abortControllerRef.current) break;
             const cleanTitle = (job.title || '').trim();
-            const normalizedTitle = cleanTitle.toLowerCase();
-            if (!normalizedTitle) continue;
+            if (!cleanTitle) continue;
+            const identity = jobIdentity(cleanTitle, job.location);
 
             const postedDate = job.postedDate ? new Date(job.postedDate) : null;
             const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
-            if (!existingDocsByTitle.has(normalizedTitle)) {
+            if (!existingDocsByIdentity.has(identity)) {
               await addDoc(collection(db, 'jobPostings'), {
                 employerId: employer.id,
                 employerName: employer.name,
                 title: cleanTitle,
-                location: job.location || 'Philadelphia, PA',
-                city: job.city || 'Philadelphia',
-                roleType: job.roleType || 'Full-time',
-                url: job.url || employer.website || 'https://www.google.com/search?q=' + encodeURIComponent(employer.name + ' careers philadelphia'),
+                location: job.location || 'Not specified',
+                city: job.city || 'Not specified',
+                roleType: job.roleType || 'Not specified',
+                url: job.url,
                 postedDate: validPostedDate,
                 foundDate: serverTimestamp(),
                 description: job.description || ''
               });
-              existingDocsByTitle.set(normalizedTitle, true);
+              existingDocsByIdentity.set(identity, true);
               employerNewJobs++;
               totalNewJobsAdded++;
             } else {
               // Existing posting is re-verified active
-              const existingDocObj = existingDocsByTitle.get(normalizedTitle);
+              const existingDocObj = existingDocsByIdentity.get(identity);
               if (existingDocObj && existingDocObj.id) {
                 await setDoc(doc(db, 'jobPostings', existingDocObj.id), {
                   foundDate: serverTimestamp(),
@@ -452,43 +459,47 @@ export default function App() {
           where('employerId', '==', employer.id)
         ));
         
-        const existingDocsByTitle = new Map<string, any>();
+        const existingDocsByIdentity = new Map<string, any>();
         existingDocs.docs.forEach(d => {
-          const t = (d.data().title || '').trim().toLowerCase();
-          if (t) existingDocsByTitle.set(t, d);
+          const data = d.data();
+          const identity = jobIdentity(data.title || '', data.location);
+          if (data.title?.trim()) existingDocsByIdentity.set(identity, d);
         });
 
-        const existingTitleList = Array.from(existingDocsByTitle.keys());
-        const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+        const existingTitleList = [...new Set(existingDocs.docs
+          .map(d => (d.data().title || '').trim())
+          .filter(Boolean))];
+        const scanResult = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+        const foundJobs = scanResult.jobs;
         totalFound = foundJobs.length;
 
         for (const job of foundJobs) {
           if (abortControllerRef.current) break;
           const cleanTitle = (job.title || '').trim();
-          const normalizedTitle = cleanTitle.toLowerCase();
-          if (!normalizedTitle) continue;
+          if (!cleanTitle) continue;
+          const identity = jobIdentity(cleanTitle, job.location);
 
           const postedDate = job.postedDate ? new Date(job.postedDate) : null;
           const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
-          if (!existingDocsByTitle.has(normalizedTitle)) {
+          if (!existingDocsByIdentity.has(identity)) {
             await addDoc(collection(db, 'jobPostings'), {
               employerId: employer.id,
               employerName: employer.name,
               title: cleanTitle,
-              location: job.location || 'Philadelphia, PA',
-              city: job.city || 'Philadelphia',
-              roleType: job.roleType || 'Full-time',
-              url: job.url || employer.website || 'https://www.google.com/search?q=' + encodeURIComponent(employer.name + ' careers philadelphia'),
+              location: job.location || 'Not specified',
+              city: job.city || 'Not specified',
+              roleType: job.roleType || 'Not specified',
+              url: job.url,
               postedDate: validPostedDate,
               foundDate: serverTimestamp(),
               description: job.description || ''
             });
-            existingDocsByTitle.set(normalizedTitle, true);
+            existingDocsByIdentity.set(identity, true);
             newJobsCount++;
           } else {
             // Existing position is verified active & refreshed
-            const existingDocObj = existingDocsByTitle.get(normalizedTitle);
+            const existingDocObj = existingDocsByIdentity.get(identity);
             if (existingDocObj && existingDocObj.id) {
               await setDoc(doc(db, 'jobPostings', existingDocObj.id), {
                 foundDate: serverTimestamp(),

@@ -1,14 +1,10 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { hasGeminiApiKey } from './_lib/gemini-jobs.js';
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
   try {
-    const apiKey = process.env.GEMINI_API_KEY || "";
-    const isConfigured = !!apiKey && apiKey !== "MY_GEMINI_API_KEY";
-
     return res.status(200).json({
       status: "ok",
-      geminiConfigured: isConfigured,
-      keyPrefix: apiKey ? `${apiKey.substring(0, 6)}...` : "none",
+      configured: hasGeminiApiKey(),
       timestamp: new Date().toISOString(),
     });
   } catch (error: any) {

@@ -20,20 +20,8 @@ export default async function handler(req: any, res: any) {
   try {
     const result: any = await scanJobsForEmployer(employerName, website, existingTitles);
 
-    if (result && typeof result === "object" && "error" in result && !result.jobs) {
-      return res.status(400).json(result);
-    }
-
-    const jobsList = Array.isArray(result?.jobs)
-      ? result.jobs
-      : (Array.isArray(result) ? result : []);
-
-    // Return the response in both formats to guarantee the frontend UI catches it
-    return res.status(200).json({
-      success: true,
-      jobs: jobsList,
-      source: result?.source || "live-scrape"
-    });
+    if (result.error) return res.status(400).json(result);
+    return res.status(200).json(result);
   } catch (error: any) {
     console.error("[scan-jobs handler error]:", error);
     return res.status(500).json({ error: error.message || "Failed to scan jobs", jobs: [] });
