@@ -18,10 +18,9 @@ test("turns Gemini authentication and quota failures into actionable safe messag
     describeGeminiError({ status: 401, message: "API key not valid" }),
     /Replace GEMINI_API_KEY in Vercel/,
   );
-  assert.match(
-    describeGeminiError({ status: 429, message: "RESOURCE_EXHAUSTED" }),
-    /quota or rate limits/i,
-  );
+  const quotaMessage = describeGeminiError({ status: 429, message: "RESOURCE_EXHAUSTED" });
+  assert.match(quotaMessage, /free Gemini quota or rate limit/i);
+  assert.doesNotMatch(quotaMessage, /billing/i);
 });
 
 test("reports an unavailable configured model without returning the raw SDK error", () => {

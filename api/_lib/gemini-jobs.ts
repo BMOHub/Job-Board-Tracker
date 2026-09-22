@@ -65,10 +65,10 @@ export function describeGeminiError(error: unknown): string {
     status === 403 ||
     /permission denied|permission_denied|access restricted|not authorized/.test(normalized)
   ) {
-    return "Gemini denied access for this API key. Confirm the key's Google Cloud project has Gemini API access and billing or free-tier quota, then redeploy.";
+    return "Gemini denied access for this API key. Confirm the key's Google Cloud project has Gemini API access and free-tier availability, then redeploy.";
   }
   if (status === 429 || /resource_exhausted|quota|rate limit|too many requests/.test(normalized)) {
-    return "Gemini quota or rate limits were reached. Wait briefly or review the Google AI Studio project's usage and billing.";
+    return "The free Gemini quota or rate limit was reached. Wait for the quota to reset; official ATS sources can still be scanned without paid grounding.";
   }
   if (status === 404 || /model.+not found|not found.+model|not supported for generatecontent/.test(normalized)) {
     return `Gemini model ${MODEL} is unavailable to this API key. Set GEMINI_MODEL to an available stable Flash model in Vercel, then redeploy.`;

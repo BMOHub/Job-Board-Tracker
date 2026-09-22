@@ -322,7 +322,6 @@ export default function App() {
     let scanSucceededCount = 0;
     let totalNewJobsAdded = 0;
     let lastScanFailure = '';
-    let quotaExhausted = false;
 
     for (let i = 0; i < targetEmployers.length; i++) {
       if (abortControllerRef.current) break;
@@ -335,10 +334,9 @@ export default function App() {
         category: mode === 'category' ? (categoryName || selectedCategory) : undefined 
       });
       
-      let retryCount = 0;
       let success = false;
 
-      while (!success && retryCount < 2 && !abortControllerRef.current) {
+      while (!success && !abortControllerRef.current) {
         try {
           // Get existing postings for this employer to track existing titles and update them
           const existingDocs = await getDocs(query(
@@ -410,31 +408,17 @@ export default function App() {
           const errMsg = error?.message || String(error);
           const isRateLimit = errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED") || errMsg.includes("quota") || errMsg.includes("rate limit");
 
-          if (isRateLimit && retryCount < 1 && !abortControllerRef.current) {
-            retryCount++;
-            console.warn(`[API Pacing] Pausing 8s before retrying ${employer.name}...`);
-            for (let c = 8; c > 0; c--) {
-              if (abortControllerRef.current) break;
-              setCooldownCountdown(c);
-              await new Promise(r => setTimeout(r, 1000));
-            }
-            setCooldownCountdown(null);
-            continue;
-          }
-
           console.error(`Error scanning ${employer.name}:`, error);
           scanFailedCount++;
           lastScanFailure = errMsg;
-          quotaExhausted = isRateLimit;
           setScanError(isRateLimit
-            ? `Scan stopped at ${employer.name}: ${errMsg}`
+            ? `Scan notice: ${employer.name} reached the free Gemini limit. Continuing so official ATS sources can still be checked...`
             : `Scan notice: ${employer.name}: ${errMsg} Continuing with remaining partners...`);
           break;
         }
       }
 
       if (success) scanSucceededCount++;
-      if (quotaExhausted) break;
 
       // Safe, brisk inter-request pacing: 2.5 seconds between employers
       if (i < targetEmployers.length - 1 && !abortControllerRef.current) {
@@ -445,9 +429,7 @@ export default function App() {
     setCooldownCountdown(null);
     if (!abortControllerRef.current) {
       setScanError(scanFailedCount > 0
-        ? quotaExhausted
-          ? `Scan stopped after ${scanSucceededCount} successful employer scan(s): ${lastScanFailure}`
-          : `${scanFailedCount} employer scan(s) failed. Last error: ${lastScanFailure}`
+        ? `${scanFailedCount} employer scan(s) could not use Gemini. Official ATS scans continued. Last error: ${lastScanFailure}`
         : null);
       setScanSuccessMsg(`Scan complete: Synced ${scanSucceededCount} of ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
     }
