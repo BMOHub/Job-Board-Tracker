@@ -435,14 +435,13 @@ export async function scanJobsForEmployer(
   }
 
   let lastWarning = "No evidence-backed open positions were found.";
-  let completedExtraction = false;
   let lastError: unknown = null;
   const officialDocument = await fetchReadablePage(targetUrl);
   if (officialDocument) {
     try {
       const documents = await collectCareerDocuments(officialDocument);
       const jobs = await extractJobs(ai, employerName, documents);
-      completedExtraction = true;
+      lastError = null;
       if (jobs.length > 0) {
         return { jobs, source: "official-page", authoritative: true };
       }
@@ -459,7 +458,7 @@ export async function scanJobsForEmployer(
       .filter((document): document is SourceDocument => Boolean(document));
     if (candidateDocuments.length > 0) {
       const jobs = await extractJobs(ai, employerName, candidateDocuments);
-      completedExtraction = true;
+      lastError = null;
       if (jobs.length > 0) {
         return { jobs, source: "grounded-pages", authoritative: false };
       }
@@ -470,7 +469,7 @@ export async function scanJobsForEmployer(
     console.warn(`[Job scanner] Grounded discovery failed for ${employerName}:`, error);
   }
 
-  if (!completedExtraction && lastError) {
+  if (lastError) {
     return {
       jobs: [],
       source: "no-jobs-found",

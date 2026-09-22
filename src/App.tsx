@@ -319,8 +319,10 @@ export default function App() {
     });
 
     let scanFailedCount = 0;
+    let scanSucceededCount = 0;
     let totalNewJobsAdded = 0;
     let lastScanFailure = '';
+    let quotaExhausted = false;
 
     for (let i = 0; i < targetEmployers.length; i++) {
       if (abortControllerRef.current) break;
@@ -423,10 +425,16 @@ export default function App() {
           console.error(`Error scanning ${employer.name}:`, error);
           scanFailedCount++;
           lastScanFailure = errMsg;
-          setScanError(`Scan notice: ${employer.name}: ${errMsg} Continuing with remaining partners...`);
+          quotaExhausted = isRateLimit;
+          setScanError(isRateLimit
+            ? `Scan stopped at ${employer.name}: ${errMsg}`
+            : `Scan notice: ${employer.name}: ${errMsg} Continuing with remaining partners...`);
           break;
         }
       }
+
+      if (success) scanSucceededCount++;
+      if (quotaExhausted) break;
 
       // Safe, brisk inter-request pacing: 2.5 seconds between employers
       if (i < targetEmployers.length - 1 && !abortControllerRef.current) {
@@ -437,10 +445,11 @@ export default function App() {
     setCooldownCountdown(null);
     if (!abortControllerRef.current) {
       setScanError(scanFailedCount > 0
-        ? `${scanFailedCount} employer scan(s) failed. Last error: ${lastScanFailure}`
+        ? quotaExhausted
+          ? `Scan stopped after ${scanSucceededCount} successful employer scan(s): ${lastScanFailure}`
+          : `${scanFailedCount} employer scan(s) failed. Last error: ${lastScanFailure}`
         : null);
-      const successfulScans = targetEmployers.length - scanFailedCount;
-      setScanSuccessMsg(`Scan complete: Synced ${successfulScans} of ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
+      setScanSuccessMsg(`Scan complete: Synced ${scanSucceededCount} of ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
     }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
