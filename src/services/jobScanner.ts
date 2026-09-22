@@ -9,7 +9,7 @@ export interface ScannedJob {
 }
 
 /**
- * Checks if the backend Gemini API is configured and operational via Vercel status route.
+ * Checks if the backend Gemini API is configured via Vercel status route.
  */
 export async function isGeminiConfigured(): Promise<boolean> {
   try {
@@ -24,7 +24,7 @@ export async function isGeminiConfigured(): Promise<boolean> {
 }
 
 /**
- * Scans an employer website by delegating scraping and extraction to the Vercel backend route.
+ * Scans an employer website by delegating scraping and extraction to /api/scan-jobs.
  */
 export async function scanJobsForEmployer(
   employerName: string,
@@ -37,14 +37,14 @@ export async function scanJobsForEmployer(
   }
 
   try {
-    const response = await fetch('/api/gemini-jobs', {
+    const response = await fetch('/api/scan-jobs', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         employerName,
-        websiteUrl,
+        website: websiteUrl,
         existingTitles
       })
     });
@@ -55,7 +55,7 @@ export async function scanJobsForEmployer(
     }
 
     const data = await response.json();
-    return Array.isArray(data.jobs) ? data.jobs : [];
+    return Array.isArray(data.jobs) ? data.jobs : (Array.isArray(data) ? data : []);
 
   } catch (error) {
     console.error(`[JobScanner] Failed scanning ${employerName}:`, error);
