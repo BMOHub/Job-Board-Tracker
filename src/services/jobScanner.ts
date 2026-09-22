@@ -22,7 +22,7 @@ export interface ScannedJob {
 
 /**
  * Scans an employer website by fetching clean markdown via Jina Reader
- * and extracting active job openings using Gemini 2.5 Flash.
+ * and extracting active job openings using Gemini 2.0 Flash.
  */
 export async function scanJobsForEmployer(
   employerName: string,
@@ -56,7 +56,7 @@ export async function scanJobsForEmployer(
       return [];
     }
 
-    // 3. Prompt Gemini 2.5 Flash to extract job listings
+    // 3. Prompt Gemini 2.0 Flash to extract job listings
     const prompt = `
 You are an expert workforce development crawler extracting job openings for "${employerName}".
 
@@ -77,7 +77,7 @@ ${truncatedText}
 `;
 
     const aiResponse = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-2.0-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json"
