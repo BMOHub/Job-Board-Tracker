@@ -23,8 +23,9 @@ export interface SourceDocument {
   text: string;
 }
 
-export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
+export const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite";
 const MODEL = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+const SEARCH_GROUNDING_ENABLED = process.env.GEMINI_ENABLE_SEARCH_GROUNDING === "true";
 const MAX_DOCUMENT_CHARS = 80_000;
 const MAX_SOURCE_DOCUMENTS = 5;
 const READER_TIMEOUT_MS = 12_000;
@@ -117,6 +118,125 @@ function normalizeEvidence(value: string): string {
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isGreaterPhiladelphiaLocation(city: string, state: string, postalCode: string): boolean {
+  const normalizedCity = normalizeEvidence(city);
+  const normalizedState = state.trim().toUpperCase();
+  const localCities = [
+    "philadelphia", "wayne", "radnor", "king of prussia", "conshohocken", "malvern",
+    "west chester", "chester", "media", "bala cynwyd", "bryn mawr", "fort washington",
+    "horsham", "blue bell", "plymouth meeting", "norristown", "lansdale", "doylestown",
+    "newtown", "yardley", "bensalem", "trevose", "exton", "paoli", "berwyn",
+    "jenkintown", "willow grove", "camden", "cherry hill", "mount laurel", "moorestown",
+  ];
+  if (localCities.includes(normalizedCity)) {
+    return true;
+  }
+  return normalizedState === "NJ" && /^(080|081)/.test(postalCode.trim());
+}
+
+function getAdpCustomField(
+  requisition: Record<string, any>,
+  collection: "dateFields" | "stringFields",
+  code: string,
+): string {
+  const fields = requisition?.customFieldGroup?.[collection];
+  if (!Array.isArray(fields)) return "";
+  const field = fields.find((candidate: any) => candidate?.nameCode?.codeValue === code);
+  return String(field?.dateValue || field?.stringValue || "").trim();
+}
+
+/** Parses official ADP Workforce Now requisitions without requiring a search API. */
+export function parseAdpJobs(payload: unknown, boardUrl: string): ScannedJob[] {
+  const requisitions = (payload as any)?.jobRequisitions;
+  if (!Array.isArray(requisitions)) return [];
+
+  const jobs: ScannedJob[] = [];
+  for (const requisition of requisitions) {
+    const title = String(requisition?.requisitionTitle || "").trim();
+    const itemId = String(requisition?.itemID || requisition?.clientRequisitionID || "").trim();
+    const locations = Array.isArray(requisition?.requisitionLocations)
+      ? requisition.requisitionLocations
+      : [];
+    const localLocation = locations.find((location: any) => {
+      const address = location?.address || {};
+      return isGreaterPhiladelphiaLocation(
+        String(address.cityName || ""),
+        String(address.countrySubdivisionLevel1?.codeValue || ""),
+        String(address.postalCode || ""),
+      );
+    });
+    if (!title || !itemId || !localLocation) continue;
+
+    const address = localLocation.address || {};
+    const city = String(address.cityName || "").trim();
+    const state = String(address.countrySubdivisionLevel1?.codeValue || "").trim();
+    const titleStates = [...title.matchAll(/,\s*([A-Z]{2})\b/g)].map((match) => match[1]);
+    if (titleStates.length > 0 && !titleStates.includes(state.toUpperCase())) continue;
+
+    const jobUrl = new URL(boardUrl);
+    jobUrl.searchParams.set("jobId", itemId);
+    jobs.push({
+      title,
+      url: jobUrl.href,
+      location: [city, state].filter(Boolean).join(", "),
+      city,
+      roleType: String(requisition?.workLevelCode?.shortName || "Not specified").trim(),
+      postedDate: getAdpCustomField(requisition, "dateFields", "PostingDate") || String(requisition?.postDate || ""),
+      description: "",
+    });
+  }
+  return jobs;
+}
+
+async function fetchAdpJobs(boardUrl: string): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    const cid = board.searchParams.get("cid");
+    const ccId = board.searchParams.get("ccId");
+    if (!cid || !ccId) return [];
+
+    const endpoint = new URL("/mascsr/default/careercenter/public/events/staffing/v1/job-requisitions", board.origin);
+    endpoint.searchParams.set("cid", cid);
+    endpoint.searchParams.set("ccId", ccId);
+    endpoint.searchParams.set("lang", "en_US");
+    endpoint.searchParams.set("locale", "en_US");
+    endpoint.searchParams.set("$skip", "0");
+    endpoint.searchParams.set("$top", "100");
+    endpoint.searchParams.set("userQuery", "");
+
+    const response = await fetch(endpoint, {
+      headers: {
+        "Accept-Language": "en_US",
+        locale: "en_US",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/json",
+        "x-forwarded-host": board.hostname,
+      },
+      signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+    });
+    if (!response.ok) return [];
+    return parseAdpJobs(await response.json(), board.href);
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read ADP board ${boardUrl}:`, error);
+    return [];
+  }
+}
+
+async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<ScannedJob[]> {
+  for (const document of documents) {
+    try {
+      const hostname = new URL(document.url).hostname.toLowerCase();
+      if (hostname === "adp.com" || hostname.endsWith(".adp.com")) {
+        const jobs = await fetchAdpJobs(document.url);
+        if (jobs.length > 0) return jobs;
+      }
+    } catch {
+      // Ignore malformed source URLs; normal evidence extraction remains available.
+    }
+  }
+  return [];
 }
 
 function extractDocumentUrls(document: SourceDocument): Set<string> {
@@ -440,6 +560,10 @@ export async function scanJobsForEmployer(
   if (officialDocument) {
     try {
       const documents = await collectCareerDocuments(officialDocument);
+      const structuredJobs = await extractStructuredAtsJobs(documents);
+      if (structuredJobs.length > 0) {
+        return { jobs: structuredJobs, source: "official-page", authoritative: true };
+      }
       const jobs = await extractJobs(ai, employerName, documents);
       lastError = null;
       if (jobs.length > 0) {
@@ -452,21 +576,25 @@ export async function scanJobsForEmployer(
     }
   }
 
-  try {
-    const candidateUrls = await discoverCandidateUrls(ai, employerName, targetUrl);
-    const candidateDocuments = (await Promise.all(candidateUrls.map(fetchReadablePage)))
-      .filter((document): document is SourceDocument => Boolean(document));
-    if (candidateDocuments.length > 0) {
-      const jobs = await extractJobs(ai, employerName, candidateDocuments);
-      lastError = null;
-      if (jobs.length > 0) {
-        return { jobs, source: "grounded-pages", authoritative: false };
+  if (SEARCH_GROUNDING_ENABLED) {
+    try {
+      const candidateUrls = await discoverCandidateUrls(ai, employerName, targetUrl);
+      const candidateDocuments = (await Promise.all(candidateUrls.map(fetchReadablePage)))
+        .filter((document): document is SourceDocument => Boolean(document));
+      if (candidateDocuments.length > 0) {
+        const jobs = await extractJobs(ai, employerName, candidateDocuments);
+        lastError = null;
+        if (jobs.length > 0) {
+          return { jobs, source: "grounded-pages", authoritative: false };
+        }
       }
+    } catch (error: any) {
+      lastError = error;
+      lastWarning = error?.message || "Grounded job-page discovery failed.";
+      console.warn(`[Job scanner] Grounded discovery failed for ${employerName}:`, error);
     }
-  } catch (error: any) {
-    lastError = error;
-    lastWarning = error?.message || "Grounded job-page discovery failed.";
-    console.warn(`[Job scanner] Grounded discovery failed for ${employerName}:`, error);
+  } else if (!lastError) {
+    lastWarning = "No evidence-backed regional openings were found on the employer's official pages. Paid search fallback is disabled.";
   }
 
   if (lastError) {

@@ -4,12 +4,13 @@ import {
   DEFAULT_GEMINI_MODEL,
   describeGeminiError,
   extractLikelyCareerLinks,
+  parseAdpJobs,
   parseEvidenceBackedJobs,
   type SourceDocument,
 } from "./gemini-jobs.js";
 
 test("uses a stable current Gemini model by default", () => {
-  assert.equal(DEFAULT_GEMINI_MODEL, "gemini-3.6-flash");
+  assert.equal(DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite");
 });
 
 test("turns Gemini authentication and quota failures into actionable safe messages", () => {
@@ -26,10 +27,10 @@ test("turns Gemini authentication and quota failures into actionable safe messag
 test("reports an unavailable configured model without returning the raw SDK error", () => {
   const message = describeGeminiError({
     status: 404,
-    message: "models/gemini-3.6-flash is not found for API version v1beta; internal trace secret-123",
+    message: "models/gemini-3.5-flash-lite is not found for API version v1beta; internal trace secret-123",
   });
 
-  assert.match(message, /gemini-3.6-flash is unavailable/i);
+  assert.match(message, /gemini-3.5-flash-lite is unavailable/i);
   assert.doesNotMatch(message, /secret-123/);
 });
 
@@ -129,4 +130,51 @@ test("discovers ATS links in raw HTML returned by the reader fallback", () => {
   assert.deepEqual(links, [
     "https://temple.taleo.net/careersection/jobs/jobsearch.ftl?lang=en",
   ]);
+});
+
+test("extracts only Greater Philadelphia jobs from an official ADP response", () => {
+  const jobs = parseAdpJobs({
+    jobRequisitions: [
+      {
+        itemID: "regional-job_1",
+        requisitionTitle: "Mechanical Engineer",
+        postDate: "2026-09-20T12:00:00Z",
+        workLevelCode: { shortName: "Full-time" },
+        requisitionLocations: [{
+          address: {
+            cityName: "Wayne",
+            countrySubdivisionLevel1: { codeValue: "PA" },
+            postalCode: "19087",
+          },
+        }],
+      },
+      {
+        itemID: "remote-job_1",
+        requisitionTitle: "Engineer in Boston",
+        requisitionLocations: [{
+          address: {
+            cityName: "Boston",
+            countrySubdivisionLevel1: { codeValue: "MA" },
+            postalCode: "02111",
+          },
+        }],
+      },
+      {
+        itemID: "mismatched-title_1",
+        requisitionTitle: "Engineer - Arlington, VA",
+        requisitionLocations: [{
+          address: {
+            cityName: "Wayne",
+            countrySubdivisionLevel1: { codeValue: "PA" },
+            postalCode: "19087",
+          },
+        }],
+      },
+    ],
+  }, "https://workforcenow.adp.com/mascsr/default/mdf/recruitment/recruitment.html?cid=client&ccId=center");
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].title, "Mechanical Engineer");
+  assert.equal(jobs[0].location, "Wayne, PA");
+  assert.match(jobs[0].url, /jobId=regional-job_1/);
 });
