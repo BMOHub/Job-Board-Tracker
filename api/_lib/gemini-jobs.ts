@@ -10,93 +10,134 @@ export interface ScannedJob {
   description: string;
 }
 
-const getApiKey = () => process.env.GEMINI_API_KEY || "";
-
-export const isGeminiConfigured = () => {
-  const key = getApiKey();
-  return !!key && key !== "MY_GEMINI_API_KEY";
-};
-
-let aiInstance: GoogleGenAI | null = null;
 const getAI = () => {
-  if (!aiInstance) {
-    const key = getApiKey();
-    if (key) {
-      aiInstance = new GoogleGenAI({
-        apiKey: key,
-        httpOptions: { headers: { "User-Agent": "aistudio-build" } },
-      });
-    }
-  }
-  return aiInstance;
+  const key = process.env.GEMINI_API_KEY || "";
+  return key ? new GoogleGenAI({ apiKey: key }) : null;
 };
 
-/**
- * Resolves relative URLs and attempts to match with Google Search Grounding URIs if available.
- */
-function findBestJobUrl(
-  rawUrl: string,
-  jobTitle: string,
-  baseUrl: string,
-  groundingChunks: any[] = []
-): string {
-  let url = (rawUrl || "").trim();
-
-  // Match title against Google Search Grounding links if present
-  if (Array.isArray(groundingChunks) && groundingChunks.length > 0) {
-    const validUris = groundingChunks
-      .map((c) => ({ uri: c?.web?.uri || "", title: c?.web?.title || "" }))
-      .filter((item) => item.uri && item.uri.startsWith("http"));
-    
-    const titleWords = jobTitle.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
-
-    for (const chunk of validUris) {
-      const chunkUri = chunk.uri.toLowerCase();
-      const chunkTitle = chunk.title.toLowerCase();
-      const matchesTitle = titleWords.some((w) => chunkTitle.includes(w) || chunkUri.includes(w));
-      if (matchesTitle) return chunk.uri;
-    }
-  }
-
-  if (!url) return baseUrl;
-
-  // Resolve relative links (e.g. "/join-our-team")
-  if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("mailto:")) {
-    try {
-      const base = baseUrl.startsWith("http") ? baseUrl : `https://${baseUrl}`;
-      url = new URL(url, base).href;
-    } catch (e) {
-      return baseUrl;
-    }
-  }
-
-  return url;
-}
-
-function sanitizeJobsArray(arr: any[], baseUrl = "", groundingChunks: any[] = []): ScannedJob[] {
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .filter((item) => item && typeof item === "object" && typeof item.title === "string")
-    .map((item) => {
-      const title = String(item.title || "").trim();
-      const rawUrl = String(item.url || "").trim();
-      const finalUrl = findBestJobUrl(rawUrl, title, baseUrl, groundingChunks);
-      return {
-        title,
-        url: finalUrl,
-        location: String(item.location || "Philadelphia, PA").trim(),
-        city: String(item.city || "Philadelphia").trim(),
-        roleType: String(item.roleType || "Full-time").trim(),
-        postedDate: String(item.postedDate || "").trim(),
-        description: String(item.description || "").trim(),
-      };
-    })
-    .filter((item) => item.title.length > 0);
-}
-
-function parseAndCleanJobsJson(rawText: string, baseUrl = "", groundingChunks: any[] = []): ScannedJob[] {
-  if (!rawText || typeof rawText !== "string") return [];
-  let text = rawText.trim();
+// Aggressive JSON parser that strips away markdown formatting
+function cleanAndParseJSON(text: string, baseUrl: string): ScannedJob[] {
+  if (!text) return [];
   
-  if (text.startsWith("```")) {
-    text = text.replace(/^
+  let cleanText = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  let parsed: any = null;
+  
+  try {
+    parsed = JSON.parse(cleanText);
+  } catch (e) {
+    const start = cleanText.indexOf("[");
+    const end = cleanText.lastIndexOf("]");
+    if (start !== -1 && end > start) {
+      try {
+        parsed = JSON.parse(cleanText.substring(start, end + 1));
+      } catch (err) {}
+    }
+  }
+
+  const jobs = Array.isArray(parsed) ? parsed : (parsed?.jobs || []);
+  const today = new Date().toISOString().split("T")[0];
+
+  return jobs.map((j: any) => {
+    let url = String(j.url || baseUrl).trim();
+    if (!url.startsWith("http") && !url.startsWith("mailto:")) {
+      try { 
+        url = new URL(url, baseUrl).href; 
+      } catch(e) { 
+        url = baseUrl; 
+      }
+    }
+    return {
+      title: String(j.title || "Unknown Title").trim(),
+      url: url,
+      location: String(j.location || "Philadelphia, PA").trim(),
+      city: String(j.city || "Philadelphia").trim(),
+      roleType: String(j.roleType || "Full-time").trim(),
+      postedDate: String(j.postedDate || today).trim(),
+      description: String(j.description || "").trim()
+    };
+  }).filter((j: any) => j.title !== "Unknown Title");
+}
+
+export async function scanJobsForEmployer(employerName: string, website: string, existingTitles: string[]) {
+  const ai = getAI();
+  if (!ai) return { error: "GEMINI_API_KEY not configured on Vercel." };
+
+  const targetUrl = website.startsWith("http") ? website : `https://${website}`;
+  let pageText = "";
+  
+  // 1. Auto-generate the correct career links if the user only provided the homepage
+  const candidateUrls = [
+    targetUrl,
+    `${new URL(targetUrl).origin}/join-our-team`,
+    `${new URL(targetUrl).origin}/careers`
+  ];
+
+  // 2. Fetch live text from the website
+  for (const url of candidateUrls) {
+    try {
+      const res = await fetch(`[https://r.jina.ai/$](https://r.jina.ai/$){url}`, { headers: { "Accept": "text/plain" }});
+      if (res.ok) {
+        const text = await res.text();
+        if (text.length > 200 && !text.includes("404 Not Found")) {
+          pageText = text.slice(0, 15000);
+          break; // Stop looking once we successfully grab the page text
+        }
+      }
+    } catch(e) {}
+  }
+
+  // 3. Extract the jobs using Gemini
+  if (pageText) {
+    const prompt = `Extract all active job openings for "${employerName}" from this webpage text.
+Return ONLY a JSON array.
+
+Website: ${targetUrl}
+
+Text:
+${pageText}
+
+Format EXACTLY like this:
+[
+  {
+    "title": "Job Title",
+    "url": "Application URL (use exact link if present, otherwise ${targetUrl})",
+    "location": "Philadelphia, PA",
+    "city": "Philadelphia",
+    "roleType": "Full-time",
+    "postedDate": "2026-09-22",
+    "description": "Short description"
+  }
+]`;
+
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: prompt
+      });
+      if (response?.text) {
+        const jobs = cleanAndParseJSON(response.text, targetUrl);
+        if (jobs.length > 0) return { jobs, source: "live-scrape" };
+      }
+    } catch (e) {
+      console.error("Gemini text extraction failed:", e);
+    }
+  }
+
+  // 4. Google Search Fallback (if the website blocks the scraper)
+  try {
+    const searchPrompt = `Search Google for active job openings at "${employerName}" in Philadelphia PA. List all positions found. Return ONLY a JSON array formatted exactly as above.`;
+    const searchRes: any = await ai.models.generateContent({
+      model: "gemini-2.0-flash",
+      contents: searchPrompt,
+      config: { tools: [{ googleSearch: {} }] }
+    });
+    if (searchRes?.text) {
+      const jobs = cleanAndParseJSON(searchRes.text, targetUrl);
+      if (jobs.length > 0) return { jobs, source: "google-search" };
+    }
+  } catch (e) {
+    console.error("Gemini search fallback failed:", e);
+  }
+
+  return { jobs: [], source: "no-jobs-found" };
+}
