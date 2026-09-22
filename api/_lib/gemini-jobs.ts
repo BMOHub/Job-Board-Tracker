@@ -200,11 +200,31 @@ export async function scanJobsForEmployer(employerName: string, website: string,
   }
 
   const existingTitlesArray: string[] = Array.isArray(existingTitles) ? existingTitles : [];
-  const existingTitlesStr = existingTitlesArray.length > 0 ? `\nCURRENTLY KNOWN POSITIONS ON BOARD: ${existingTitlesArray.slice(0, 10).join("; ")}. Actively find ADDITIONAL or NEW open positions for this employer that are not already listed above.` : "";
+  const existingTitlesStr = existingTitlesArray.length > 0
+    ? `\nCURRENTLY KNOWN POSITIONS ON BOARD: ${existingTitlesArray.slice(0, 10).join("; ")}. Actively find ADDITIONAL or NEW open positions for this employer that are not already listed above.`
+    : "";
+
+  // 1. Fetch live markdown text from target website using Jina Reader
+  let liveWebText = "";
+  if (website && website.startsWith("http")) {
+    try {
+      const jinaUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){encodeURIComponent(website.trim())}`;
+      const jinaRes = await fetch(jinaUrl, { headers: { "Accept": "text/markdown" } });
+      if (jinaRes.ok) {
+        const rawText = await jinaRes.text();
+        liveWebText = rawText.slice(0, 8000); // Cap at 8,000 characters
+      }
+    } catch (e) {
+      console.warn("[gemini-jobs] Jina fetch failed, falling back to AI prompt search.");
+    }
+  }
 
   const prompt = `You are an expert Philadelphia workforce scout. Find active, realistic job openings at "${employerName}" located in the Greater Philadelphia area.
 
 Official Reference Website: ${website || "Not provided"}${existingTitlesStr}
+
+Live Web Page Content:
+${liveWebText || "No live content retrieved."}
 
 CRITICAL DEEP-LINK REQUIREMENTS:
 - Provide the direct career portal or job application URL starting with https:// or http://.
@@ -239,7 +259,7 @@ Each object MUST contain:
   const primaryModel = "gemini-2.0-flash";
   let lastError: any = null;
 
-  // 1. Primary Structured JSON Call
+  // 2. Primary Structured JSON Call with Scraped Page Content
   try {
     const response = await ai.models.generateContent({
       model: primaryModel,
@@ -254,13 +274,13 @@ Each object MUST contain:
     lastError = modelError;
   }
 
-  // 2. Google Search Grounded Fallback (Text mode to prevent schema conflicts)
+  // 3. Google Search Grounded Fallback
   const isSearchDisabled = Date.now() < searchGroundingDisabledUntil;
   if (!isSearchDisabled) {
     try {
       const searchPromise = ai.models.generateContent({
         model: primaryModel,
-        contents: `${prompt}\n\nReturn output strict as a JSON array string inside triple backticks (\`\`\`json ... \`\`\`).`,
+        contents: `${prompt}\n\nReturn output strictly as a JSON array string inside triple backticks (\`\`\`json ... \`\`\`).`,
         config: { tools: [{ googleSearch: {} }] },
       });
       const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Search Grounding timeout")), 5000));
@@ -276,7 +296,7 @@ Each object MUST contain:
     }
   }
 
-  // 3. Domain Synthesis Fallback
+  // 4. Domain Synthesis Fallback
   const fallbackJobs = generateDomainFallbackJobs(employerName, website, existingTitlesArray);
   if (fallbackJobs.length > 0) return { jobs: fallbackJobs, source: "domain-synthesis" };
 
