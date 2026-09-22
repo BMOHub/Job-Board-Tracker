@@ -39,6 +39,17 @@ function findBestJobUrl(
   groundingChunks: any[]
 ): string {
   let url = (rawUrl || "").trim();
+
+  // Resolve relative links (e.g. "/careers/job/123") into full clickable URLs
+  if (url && !url.startsWith("http://") && !url.startsWith("https://")) {
+    try {
+      const baseUrl = website && website.startsWith("http") ? website : `https://${website}`;
+      url = new URL(url, baseUrl).href;
+    } catch (e) {
+      // Ignore URL parsing failure
+    }
+  }
+
   const isGenericOrHomepage = (u: string): boolean => {
     if (!u || !u.startsWith("http")) return true;
     try {
@@ -90,9 +101,9 @@ function findBestJobUrl(
       }
     }
   }
+
   if (!isGenericOrHomepage(url)) return url;
-  const searchFallback = `https://www.google.com/search?q=${encodeURIComponent(employerName + " " + jobTitle + " jobs philadelphia")}`;
-  return url && url.startsWith("http") ? url : searchFallback;
+  return website && website.startsWith("http") ? website : `https://www.google.com/search?q=${encodeURIComponent(employerName + " " + jobTitle + " jobs philadelphia")}`;
 }
 
 function sanitizeJobsArray(arr: any[], employerName = "", website = "", groundingChunks: any[] = []): any[] {
@@ -219,21 +230,25 @@ export async function scanJobsForEmployer(employerName: string, website: string,
     }
   }
 
-  const prompt = `You are an expert Philadelphia workforce scout. Find active, realistic job openings at "${employerName}" located in the Greater Philadelphia area.
+  const prompt = `You are an expert Philadelphia workforce scout. Find active job openings at "${employerName}" located in Greater Philadelphia.
+
+Analyze the raw web content below to extract active job listings.
+
+CRITICAL DIRECT LINK REQUIREMENTS:
+- Look specifically for the specific job detail/application link associated with each job title in the markdown text.
+- If a relative URL is found (e.g. "/careers/detail?id=1234" or "job/567"), return that exact string in the "url" field.
+- Do NOT default to the main website homepage if a more specific job or application link exists in the text.
 
 Official Reference Website: ${website || "Not provided"}${existingTitlesStr}
 
 Live Web Page Content:
 ${liveWebText || "No live content retrieved."}
 
-CRITICAL DEEP-LINK REQUIREMENTS:
-- Provide the direct career portal or job application URL starting with https:// or http://.
-
 Return a JSON array of 3 to 8 openings.
 Each object MUST contain:
-- "title": Job title
-- "url": The exact or direct careers URL
-- "location": Location (e.g., "Philadelphia, PA")
+- "title": Specific Job Title
+- "url": Exact specific posting URL or relative link extracted from the text
+- "location": Full location string (e.g., "Philadelphia, PA")
 - "city": City name (e.g., "Philadelphia")
 - "roleType": "Full-time", "Part-time", "Contract", or "Internship"
 - "postedDate": Date posted (YYYY-MM-DD)
