@@ -31,94 +31,47 @@ const getAI = () => {
   return aiInstance;
 };
 
-function findBestJobUrl(
-  rawUrl: string,
-  jobTitle: string,
-  employerName: string,
-  website: string,
-  groundingChunks: any[]
-): string {
+/**
+ * Resolves relative URLs (/get-involved/join-our-team) against the base website domain.
+ */
+function resolveJobUrl(rawUrl: string, baseUrl: string): string {
   let url = (rawUrl || "").trim();
+  if (!url) return baseUrl;
 
-  // 1. Resolve relative paths (/careers/job/123 -> https://company.com/careers/job/123)
-  if (url && !url.startsWith("http://") && !url.startsWith("https://")) {
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
     try {
-      const baseUrl = website && website.startsWith("http") ? website : `https://${website}`;
-      url = new URL(url, baseUrl).href;
+      const base = baseUrl.startsWith("http") ? baseUrl : `https://${baseUrl}`;
+      url = new URL(url, base).href;
     } catch (e) {
-      // Ignore URL parsing failure
+      return baseUrl;
     }
   }
-
-  // 2. Determine if a URL is generic (bare homepage or plain /careers with no parameters/IDs)
-  const isGenericOrHomepage = (u: string): boolean => {
-    if (!u || !u.startsWith("http")) return true;
-    try {
-      const parsed = new URL(u);
-      const pathname = parsed.pathname.toLowerCase().replace(/\/$/, "");
-
-      // If URL contains query parameters or anchor hashes (e.g. ?id=123 or #job-456), treat as deep link
-      if (parsed.search || parsed.hash) return false;
-
-      if (!pathname || pathname === "") return true;
-
-      const genericPaths = [
-        "/careers", "/career", "/jobs", "/job", "/work-with-us",
-        "/join-us", "/about/careers", "/pages/careers", "/en-us",
-        "/about", "/about-us", "/home", "/employment"
-      ];
-
-      if (genericPaths.includes(pathname)) return true;
-
-      if (website) {
-        try {
-          const empParsed = new URL(website);
-          if (parsed.hostname === empParsed.hostname && pathname === empParsed.pathname.toLowerCase().replace(/\/$/, "")) return true;
-        } catch (e) {}
-      }
-      return false;
-    } catch (e) {
-      return true;
-    }
-  };
-
-  // 3. Grounding chunk matching for ATS domains
-  if (Array.isArray(groundingChunks) && groundingChunks.length > 0) {
-    const validUris = groundingChunks
-      .map((c) => ({ uri: c?.web?.uri || "", title: c?.web?.title || "" }))
-      .filter((item) => item.uri && item.uri.startsWith("http"));
-    const titleWords = jobTitle.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
-
-    for (const chunk of validUris) {
-      const chunkUri = chunk.uri.toLowerCase();
-      const chunkTitle = chunk.title.toLowerCase();
-      const isAtsLink = [
-        "myworkdayjobs.com", "greenhouse.io", "lever.co", "taleo.net",
-        "oraclecloud.com", "icims.com", "smartrecruiters.com", "ultipro.com",
-        "ukg.com", "bamboohr.com", "adp.com", "jobvite.com",
-        "linkedin.com/jobs/view", "indeed.com/viewjob", "ziprecruiter.com/jobs"
-      ].some((k) => chunkUri.includes(k));
-      const matchesTitle = titleWords.some((w) => chunkTitle.includes(w) || chunkUri.includes(w));
-      if (isAtsLink && matchesTitle) return chunk.uri;
-    }
-  }
-
-  // 4. Return specific URL if valid; fall back to website or search query
-  if (!isGenericOrHomepage(url)) return url;
-  return website && website.startsWith("http") ? website : `https://www.google.com/search?q=${encodeURIComponent(employerName + " " + jobTitle + " jobs philadelphia")}`;
+  return url;
 }
 
-function sanitizeJobsArray(arr: any[], employerName = "", website = "", groundingChunks: any[] = []): any[] {
+/**
+ * Finds sub-page links like "Careers", "Join Our Team", or "Jobs" in homepage markdown.
+ */
+function findCareerLinkInMarkdown(markdown: string, baseUrl: string): string | null {
+  const linkRegex = /\[([^\]]*?(?:careers?|join\s+our\s+team|jobs?|work\s+with\s+us|employment|openings|positions)[^\]]*?)\]\((https?:\/\/[^\s\)]+|\/[^\s\)]+)\)/gi;
+  const match = linkRegex.exec(markdown);
+  if (match && match[2]) {
+    return resolveJobUrl(match[2], baseUrl);
+  }
+  return null;
+}
+
+function sanitizeJobsArray(arr: any[], website = ""): ScannedJob[] {
   if (!Array.isArray(arr)) return [];
   return arr
     .filter((item) => item && typeof item === "object" && typeof item.title === "string")
     .map((item) => {
       const title = String(item.title || "").trim();
       const rawUrl = String(item.url || "").trim();
-      const bestUrl = findBestJobUrl(rawUrl, title, employerName, website, groundingChunks);
+      const finalUrl = resolveJobUrl(rawUrl, website);
       return {
         title,
-        url: bestUrl,
+        url: finalUrl,
         location: String(item.location || "Philadelphia, PA").trim(),
         city: String(item.city || "Philadelphia").trim(),
         roleType: String(item.roleType || "Full-time").trim(),
@@ -126,10 +79,10 @@ function sanitizeJobsArray(arr: any[], employerName = "", website = "", groundin
         description: String(item.description || "").trim(),
       };
     })
-    .filter((item) => item.title.length > 0 && item.url.startsWith("http"));
+    .filter((item) => item.title.length > 0);
 }
 
-function parseAndCleanJobsJson(rawText: string, employerName = "", website = "", groundingChunks: any[] = []): any[] {
+function parseAndCleanJobsJson(rawText: string, website = ""): ScannedJob[] {
   if (!rawText || typeof rawText !== "string") return [];
   let text = rawText.trim();
   if (text.startsWith("```")) {
@@ -137,8 +90,8 @@ function parseAndCleanJobsJson(rawText: string, employerName = "", website = "",
   }
   try {
     const parsed = JSON.parse(text);
-    if (Array.isArray(parsed)) return sanitizeJobsArray(parsed, employerName, website, groundingChunks);
-    if (parsed && Array.isArray(parsed.jobs)) return sanitizeJobsArray(parsed.jobs, employerName, website, groundingChunks);
+    if (Array.isArray(parsed)) return sanitizeJobsArray(parsed, website);
+    if (parsed && Array.isArray(parsed.jobs)) return sanitizeJobsArray(parsed.jobs, website);
   } catch (e) {}
 
   const firstBracket = text.indexOf("[");
@@ -147,112 +100,47 @@ function parseAndCleanJobsJson(rawText: string, employerName = "", website = "",
     const arrayStr = text.substring(firstBracket, lastBracket + 1);
     try {
       const parsed = JSON.parse(arrayStr);
-      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed, employerName, website, groundingChunks);
+      if (Array.isArray(parsed)) return sanitizeJobsArray(parsed, website);
     } catch (e) {}
   }
 
-  const recoveredJobs: any[] = [];
-  const objectRegex = /\{[\s\S]*?"title"[\s\S]*?"url"[\s\S]*?\}/g;
-  let match: RegExpExecArray | null;
-  while ((match = objectRegex.exec(text)) !== null) {
-    try {
-      const objStr = match[0].replace(/[\x00-\x1F\x7F]/g, (char) => (char === "\t" ? " " : char === "\n" ? "\\n" : "")).replace(/,\s*([\]}])/g, "$1");
-      const obj = JSON.parse(objStr);
-      if (obj && obj.title && obj.url) recoveredJobs.push(obj);
-    } catch (err) {}
-  }
-  return sanitizeJobsArray(recoveredJobs, employerName, website, groundingChunks);
+  return [];
 }
 
-let searchGroundingDisabledUntil = 0;
+/**
+ * Extracts jobs from scraped Markdown content using Gemini 2.0 Flash.
+ */
+async function extractJobsWithGemini(
+  ai: GoogleGenAI,
+  employerName: string,
+  websiteUrl: string,
+  markdownText: string,
+  existingTitlesStr: string
+): Promise<ScannedJob[]> {
+  if (!markdownText || markdownText.length < 50) return [];
 
-function generateDomainFallbackJobs(employerName: string, website: string, existingTitles: string[] = []): ScannedJob[] {
-  const normName = employerName.toLowerCase();
-  const knownSet = new Set(existingTitles.map((t) => t.toLowerCase()));
-  const today = new Date().toISOString().split("T")[0];
-  const directPortal = website && website.startsWith("http") ? website : "[https://www.google.com/search?q=](https://www.google.com/search?q=)" + encodeURIComponent(employerName + " careers philadelphia");
-  type RoleTemplate = { title: string; roleType: string; desc: string };
-  let templates: RoleTemplate[] = [];
+  const prompt = `You are an expert workforce crawler extracting active, real job openings for "${employerName}" in Greater Philadelphia.
 
-  if (normName.includes("bala") || normName.includes("engineer") || normName.includes("trane") || normName.includes("kaks") || normName.includes("ifm")) {
-    templates = [
-      { title: "Mechanical / HVAC Design Engineer", roleType: "Full-time", desc: "Design and coordinate mechanical, HVAC, and energy systems for commercial projects in Greater Philadelphia." },
-      { title: "Electrical Project Engineer", roleType: "Full-time", desc: "Perform power distribution and engineering specifications for multidisciplinary design projects." },
-      { title: "BIM & Revit Coordination Specialist", roleType: "Full-time", desc: "Develop 3D building models, coordinate clash detection, and produce engineering documentation." },
-    ];
-  } else if (normName.includes("bank") || normName.includes("financial") || normName.includes("vanguard") || normName.includes("pnc") || normName.includes("santander")) {
-    templates = [
-      { title: "Universal Banker / Customer Associate", roleType: "Full-time", desc: "Provide comprehensive financial services, account maintenance, and client advisory assistance at Philadelphia branches." },
-      { title: "Financial Services Representative", roleType: "Full-time", desc: "Assist clients with personal banking, loan applications, and digital banking support." },
-    ];
-  } else if (normName.includes("school") || normName.includes("university") || normName.includes("penn") || normName.includes("temple") || normName.includes("spin")) {
-    templates = [
-      { title: "Instructional Assistant / Classroom Aide", roleType: "Full-time", desc: "Support classroom educators with student guidance and curriculum implementation." },
-      { title: "Academic Program Coordinator", roleType: "Full-time", desc: "Coordinate educational programs, student scheduling, and administrative support." },
-    ];
-  } else {
-    templates = [
-      { title: "Operations & Administrative Coordinator", roleType: "Full-time", desc: "Coordinate daily business operations, client scheduling, and workflow management in Philadelphia." },
-      { title: "Customer Success Representative", roleType: "Full-time", desc: "Handle inbound customer requests, resolve inquiries, and maintain high satisfaction metrics." },
-    ];
-  }
-
-  const results: ScannedJob[] = [];
-  for (const t of templates) {
-    if (!knownSet.has(t.title.toLowerCase())) {
-      results.push({ title: t.title, url: directPortal, location: "Philadelphia, PA", city: "Philadelphia", roleType: t.roleType, postedDate: today, description: t.desc });
-    }
-  }
-  return results.slice(0, 4);
-}
-
-export async function scanJobsForEmployer(employerName: string, website: string, existingTitles: string[]) {
-  const ai = getAI();
-  if (!ai) {
-    return { error: "GEMINI_API_KEY is not configured on Vercel environment variables." };
-  }
-
-  const existingTitlesArray: string[] = Array.isArray(existingTitles) ? existingTitles : [];
-  const existingTitlesStr = existingTitlesArray.length > 0
-    ? `\nCURRENTLY KNOWN POSITIONS ON BOARD: ${existingTitlesArray.slice(0, 10).join("; ")}. Actively find ADDITIONAL or NEW open positions for this employer that are not already listed above.`
-    : "";
-
-  let liveWebText = "";
-  if (website && website.startsWith("http")) {
-    try {
-      const jinaUrl = `https://r.jina.ai/${encodeURIComponent(website.trim())}`;
-      const jinaRes = await fetch(jinaUrl, { headers: { "Accept": "text/markdown" } });
-      if (jinaRes.ok) {
-        const rawText = await jinaRes.text();
-        liveWebText = rawText.slice(0, 8000);
-      }
-    } catch (e) {
-      console.warn("[gemini-jobs] Jina fetch failed, falling back to AI prompt search.");
-    }
-  }
-
-  const prompt = `You are an expert workforce crawler extracting active job postings for "${employerName}" located in Greater Philadelphia.
-
-Extract individual active job listings from the raw web content below.
+Analyze the raw web content below to extract actual open job positions and internships.
 
 URL EXTRACTION RULES:
-- Inspect every Markdown link [Job Title](href) or HTML anchor tag in the content.
-- If a direct job URL exists (e.g., "[https://company.greenhouse.io/job/123](https://company.greenhouse.io/job/123)", "/careers/detail?id=99", or "[myworkdayjobs.com/](https://myworkdayjobs.com/)..."), extract that EXACT string into the "url" property.
-- Only return the base career page URL if NO job-specific link or relative link exists for that role.
+- Inspect every Markdown link [Job Title](href) or application link in the content.
+- If a direct job URL or relative link exists (e.g., "/get-involved/join-our-team" or "mailto:careers@wacphila.org"), extract it.
+- Default to "${websiteUrl}" if no specific job application link is present.
 
-Official Reference Website: ${website || "Not provided"}${existingTitlesStr}
+Official Reference Website: ${websiteUrl}${existingTitlesStr}
 
-Live Web Page Content:
-${liveWebText || "No live content retrieved."}
+Page Content:
+${markdownText}
 
-Return a JSON array of 3 to 8 openings.
+Return a JSON array of active openings listed on this page.
 Each object MUST contain:
-- "title": Job title
-- "url": Direct application/posting URL or relative link
+- "title": Exact Job Title (e.g. "Chief External Affairs Officer", "Global Smarts Program Mentor")
+- "url": Application or detail link
 - "location": Location (e.g., "Philadelphia, PA")
 - "city": City name (e.g., "Philadelphia")
 - "roleType": "Full-time", "Part-time", "Contract", or "Internship"
-- "postedDate": Date posted (YYYY-MM-DD)
+- "postedDate": Date posted (YYYY-MM-DD) or current date
 - "description": 1-2 sentence description of key duties.`;
 
   const schemaConfig = {
@@ -272,46 +160,71 @@ Each object MUST contain:
     },
   };
 
-  const primaryModel = "gemini-2.0-flash";
-  let lastError: any = null;
-
   try {
     const response = await ai.models.generateContent({
-      model: primaryModel,
+      model: "gemini-2.0-flash",
       contents: prompt,
       config: { responseMimeType: "application/json", responseSchema: schemaConfig },
     });
+
     if (response && response.text) {
-      const jobs = parseAndCleanJobsJson(response.text, employerName, website, []);
-      if (jobs.length > 0) return { jobs, source: `ai-model (${primaryModel})` };
+      return parseAndCleanJobsJson(response.text, websiteUrl);
     }
-  } catch (modelError: any) {
-    lastError = modelError;
+  } catch (error) {
+    console.error("[gemini-jobs extraction error]:", error);
   }
 
-  const isSearchDisabled = Date.now() < searchGroundingDisabledUntil;
-  if (!isSearchDisabled) {
+  return [];
+}
+
+export async function scanJobsForEmployer(employerName: string, website: string, existingTitles: string[]) {
+  const ai = getAI();
+  if (!ai) {
+    return { error: "GEMINI_API_KEY is not configured on Vercel environment variables." };
+  }
+
+  const existingTitlesArray: string[] = Array.isArray(existingTitles) ? existingTitles : [];
+  const existingTitlesStr = existingTitlesArray.length > 0
+    ? `\nCURRENTLY KNOWN POSITIONS ON BOARD: ${existingTitlesArray.slice(0, 10).join("; ")}. Ignore these exact titles.`
+    : "";
+
+  let targetUrl = (website || "").trim();
+  let liveWebText = "";
+
+  // 1. Fetch live markdown text from target website
+  if (targetUrl && targetUrl.startsWith("http")) {
     try {
-      const searchPromise = ai.models.generateContent({
-        model: primaryModel,
-        contents: `${prompt}\n\nReturn output strictly as a JSON array string inside triple backticks (\`\`\`json ... \`\`\`).`,
-        config: { tools: [{ googleSearch: {} }] },
-      });
-      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Search Grounding timeout")), 5000));
-      const response: any = await Promise.race([searchPromise, timeoutPromise]);
-      if (response && response.text) {
-        const groundingChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
-        const jobs = parseAndCleanJobsJson(response.text, employerName, website, groundingChunks);
-        if (jobs.length > 0) return { jobs, source: "search-grounded" };
+      const jinaUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){encodeURIComponent(targetUrl)}`;
+      const jinaRes = await fetch(jinaUrl, { headers: { "Accept": "text/markdown" } });
+      if (jinaRes.ok) {
+        const rawText = await jinaRes.text();
+        liveWebText = rawText.slice(0, 12000);
       }
-    } catch (searchError: any) {
-      const isQuota = searchError?.status === 429 || String(searchError?.message).includes("429");
-      if (isQuota) searchGroundingDisabledUntil = Date.now() + 15 * 60 * 1000;
+    } catch (e) {
+      console.warn("[gemini-jobs] Jina fetch failed for initial URL");
     }
   }
 
-  const fallbackJobs = generateDomainFallbackJobs(employerName, website, existingTitlesArray);
-  if (fallbackJobs.length > 0) return { jobs: fallbackJobs, source: "domain-synthesis" };
+  // 2. Extract jobs from initial URL
+  let jobs = await extractJobsWithGemini(ai, employerName, targetUrl, liveWebText, existingTitlesStr);
 
-  return { jobs: [], source: "fallback-empty", warning: lastError?.message || "No jobs found" };
+  // 3. If no jobs found on main page, search for a "Careers" or "Join Our Team" link and follow it
+  if (jobs.length === 0 && liveWebText) {
+    const careerSubUrl = findCareerLinkInMarkdown(liveWebText, targetUrl);
+    if (careerSubUrl && careerSubUrl !== targetUrl) {
+      try {
+        const jinaSubUrl = `[https://r.jina.ai/$](https://r.jina.ai/$){encodeURIComponent(careerSubUrl)}`;
+        const jinaSubRes = await fetch(jinaSubUrl, { headers: { "Accept": "text/markdown" } });
+        if (jinaSubRes.ok) {
+          const subPageText = (await jinaSubRes.text()).slice(0, 12000);
+          jobs = await extractJobsWithGemini(ai, employerName, careerSubUrl, subPageText, existingTitlesStr);
+        }
+      } catch (e) {
+        console.warn("[gemini-jobs] Jina fetch failed for sub-career URL");
+      }
+    }
+  }
+
+  // Returns only real scraped jobs (no placeholder/fake roles)
+  return { jobs, source: jobs.length > 0 ? "live-scrape" : "no-jobs-found" };
 }
