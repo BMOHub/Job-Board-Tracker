@@ -15,22 +15,15 @@ export default async function handler(req: any, res: any) {
   try {
     const result: any = await scanJobsForEmployer(employerName, targetUrl, existingTitles || []);
 
-    // Check if scanJobsForEmployer returned an error
-    if (result && result.error) {
+    if (result && typeof result === "object" && "error" in result) {
       return res.status(400).json(result);
     }
 
-    // Check if result is an object containing a jobs array { jobs: [...], source: "..." }
-    if (result && Array.isArray(result.jobs)) {
-      return res.status(200).json(result);
-    }
+    const jobsList = Array.isArray(result?.jobs)
+      ? result.jobs
+      : (Array.isArray(result) ? result : []);
 
-    // Fallback if result is a direct array [...]
-    if (Array.isArray(result)) {
-      return res.status(200).json({ jobs: result });
-    }
-
-    return res.status(200).json({ jobs: [] });
+    return res.status(200).json({ jobs: jobsList, source: result?.source });
   } catch (error: any) {
     console.error("[scan-jobs handler error]:", error);
     return res.status(500).json({ error: error.message || "Failed to scan jobs", jobs: [] });
