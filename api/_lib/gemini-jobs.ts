@@ -39,13 +39,18 @@ function cleanAndParseJSON(text: string, baseUrl: string): ScannedJob[] {
 
   return jobs.map((j: any) => {
     let url = String(j.url || baseUrl).trim();
-    if (!url.startsWith("http") && !url.startsWith("mailto:")) {
+    
+    // FIX: Prevent "mailto:" links from opening an email draft. Redirect to the website instead.
+    if (url.startsWith("mailto:")) {
+      url = baseUrl; 
+    } else if (!url.startsWith("http")) {
       try { 
         url = new URL(url, baseUrl).href; 
       } catch(e) { 
         url = baseUrl; 
       }
     }
+
     return {
       title: String(j.title || "Unknown Title").trim(),
       url: url,
@@ -63,43 +68,87 @@ export async function scanJobsForEmployer(employerName: string, website: string,
   if (!ai) return { error: "GEMINI_API_KEY not configured on Vercel." };
 
   const targetUrl = website.startsWith("http") ? website : `https://${website}`;
+  let pageText = "";
+  let jobs: ScannedJob[] = [];
   
-  // 1. Force Gemini to use Google Search Grounding to extract the actual active roles
-  try {
-    const searchPrompt = `Search the live website "${targetUrl}" (and its subpages like /join-our-team or /careers) for active job openings, careers, and internships at "${employerName}" in Philadelphia.
+  // 1. Auto-generate candidate URLs for all companies
+  const candidateUrls = [
+    targetUrl,
+    `${new URL(targetUrl).origin}/careers`,
+    `${new URL(targetUrl).origin}/join-our-team`,
+    `${new URL(targetUrl).origin}/jobs`
+  ];
 
-I need a precise list of the ACTUAL job titles listed on their careers page right now.
+  // 2. Fetch live text from the website (RESTORED for all companies)
+  for (const url of candidateUrls) {
+    try {
+      const res = await fetch(`https://r.jina.ai/${url}`, { headers: { "Accept": "text/plain" }});
+      if (res.ok) {
+        const text = await res.text();
+        // Skip if Cloudflare blocks us or page is 404
+        if (text.length > 200 && !text.includes("404 Not Found") && !text.includes("403 Forbidden") && !text.includes("Just a moment")) {
+          pageText = text.slice(0, 15000);
+          break; 
+        }
+      }
+    } catch(e) {}
+  }
 
-Return ONLY a JSON array. Do not write any conversational text.
+  // 3. Extract the jobs using Gemini
+  if (pageText) {
+    const prompt = `Extract all active job openings for "${employerName}" from this webpage text.
+Return ONLY a JSON array.
+
+Website: ${targetUrl}
+
+Text:
+${pageText}
+
 Format EXACTLY like this:
 [
   {
-    "title": "Exact Job Title Found (e.g. Chief External Affairs Officer)",
-    "url": "${targetUrl}",
+    "title": "Job Title",
+    "url": "Application URL (use exact http link if present, otherwise ${targetUrl})",
     "location": "Philadelphia, PA",
     "city": "Philadelphia",
     "roleType": "Full-time",
     "postedDate": "2026-09-22",
-    "description": "Short summary of role"
+    "description": "Short description"
   }
 ]`;
 
-    const searchRes: any = await ai.models.generateContent({
-      model: "gemini-2.5-flash", 
-      contents: searchPrompt,
-      config: { tools: [{ googleSearch: {} }] }
-    });
-
-    if (searchRes?.text) {
-      const jobs = cleanAndParseJSON(searchRes.text, targetUrl);
-      if (jobs.length > 0) return { jobs, source: "google-search-grounded" };
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: prompt
+      });
+      if (response?.text) {
+        jobs = cleanAndParseJSON(response.text, targetUrl);
+      }
+    } catch (e) {
+      console.error("Gemini text extraction failed:", e);
     }
-  } catch (e) {
-    console.error("Gemini search fallback failed:", e);
   }
 
-  // 2. Hardcoded fallback for World Affairs Council since we know they block Vercel IPs
-  if (employerName.toLowerCase().includes("world affairs council")) {
+  // 4. Google Search Fallback (if the website blocks the scraper)
+  if (jobs.length === 0) {
+    try {
+      const searchPrompt = `Search Google for active job openings at "${employerName}" in Philadelphia PA. List all positions found. Return ONLY a JSON array formatted exactly as above.`;
+      const searchRes: any = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: searchPrompt,
+        config: { tools: [{ googleSearch: {} }] }
+      });
+      if (searchRes?.text) {
+        jobs = cleanAndParseJSON(searchRes.text, targetUrl);
+      }
+    } catch (e) {
+      console.error("Gemini search fallback failed:", e);
+    }
+  }
+
+  // 5. Hardcoded fallback for World Affairs Council since they aggressively block cloud servers
+  if (jobs.length === 0 && employerName.toLowerCase().includes("world affairs council")) {
     return {
       jobs: [
         {
@@ -122,7 +171,7 @@ Format EXACTLY like this:
         },
         {
           title: "Graphic Design & Social Media Intern",
-          url: "mailto:careers@wacphila.org",
+          url: "https://wacphila.org/join-our-team/",
           location: "Philadelphia, PA",
           city: "Philadelphia",
           roleType: "Internship",
@@ -131,7 +180,7 @@ Format EXACTLY like this:
         },
         {
           title: "Professional Exchanges Intern",
-          url: "mailto:careers@wacphila.org",
+          url: "https://wacphila.org/join-our-team/",
           location: "Philadelphia, PA",
           city: "Philadelphia",
           roleType: "Internship",
@@ -140,7 +189,7 @@ Format EXACTLY like this:
         },
         {
           title: "Youth Programming Intern",
-          url: "mailto:careers@wacphila.org",
+          url: "https://wacphila.org/join-our-team/",
           location: "Philadelphia, PA",
           city: "Philadelphia",
           roleType: "Internship",
@@ -152,5 +201,5 @@ Format EXACTLY like this:
     };
   }
 
-  return { jobs: [], source: "no-jobs-found" };
+  return { jobs, source: jobs.length > 0 ? "live-scrape" : "no-jobs-found" };
 }
