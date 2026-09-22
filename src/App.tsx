@@ -270,6 +270,10 @@ export default function App() {
 
   const scanAll = async (mode: 'all' | 'unscanned' | 'category' = 'unscanned', categoryName?: string) => {
     if (isScanning) return;
+    if (apiConfigured === false) {
+      setScanError("Scanning is unavailable until GEMINI_API_KEY is configured in the server environment.");
+      return;
+    }
 
     let targetEmployers: Employer[] = [];
     let scanScopeTitle = '';
@@ -442,6 +446,10 @@ export default function App() {
 
   const scanEmployer = async (employer: Employer) => {
     if (isScanning) return;
+    if (apiConfigured === false) {
+      setScanError("Scanning is unavailable until GEMINI_API_KEY is configured in the server environment.");
+      return;
+    }
     setIsScanning(true);
     setScanError(null);
     setScanSuccessMsg(null);
@@ -828,10 +836,10 @@ export default function App() {
                 {selectedCategory !== 'All' && (
                   <button
                     onClick={() => scanAll('category', selectedCategory)}
-                    disabled={isScanning}
+                    disabled={isScanning || apiConfigured === false}
                     title={`Scan only employers in ${selectedCategory} (fast & quota-safe)`}
                     className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
-                      isScanning 
+                      isScanning || apiConfigured === false
                         ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                         : 'bg-amber-500 hover:bg-amber-600 text-white shadow-amber-200'
                     }`}
@@ -843,10 +851,10 @@ export default function App() {
 
                 <button
                   onClick={() => scanAll('unscanned')}
-                  disabled={isScanning}
+                  disabled={isScanning || apiConfigured === false}
                   title="Scan partners not scanned in the last 24 hours (fastest & free-tier friendly)"
                   className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
-                    isScanning 
+                    isScanning || apiConfigured === false
                       ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                       : 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-200'
                   }`}
@@ -856,10 +864,10 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => scanAll('all')}
-                  disabled={isScanning}
+                  disabled={isScanning || apiConfigured === false}
                   title="Force re-scan of all 44 employer partners with safe free-tier rate-pacing"
                   className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all border text-sm cursor-pointer ${
-                    isScanning 
+                    isScanning || apiConfigured === false
                       ? 'border-slate-200 text-slate-300 cursor-not-allowed bg-slate-50' 
                       : 'border-slate-200 hover:bg-slate-50 text-slate-700 bg-white'
                   }`}
@@ -868,6 +876,16 @@ export default function App() {
                 </button>
               </div>
             </div>
+
+            {apiConfigured === false && (
+              <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-amber-800 text-xs shadow-sm">
+                <KeyRound className="w-4 h-4 flex-shrink-0" />
+                <div>
+                  <span className="font-bold uppercase tracking-wider block mb-0.5">Scanning is not configured</span>
+                  Add <code className="font-mono font-bold">GEMINI_API_KEY</code> to the server environment, then reload this page.
+                </div>
+              </div>
+            )}
 
             {scanError && (
               <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl flex items-center gap-3 text-red-700 text-xs shadow-sm">
@@ -907,7 +925,7 @@ export default function App() {
                     <button
                       key={cat}
                       onClick={() => scanAll('category', cat)}
-                      disabled={isScanning}
+                      disabled={isScanning || apiConfigured === false}
                       title={`Quick scan ${cat} (${count} partners) - ~${Math.max(count * 6, 10)} seconds`}
                       className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 hover:bg-amber-50 hover:text-amber-700 hover:border-amber-300 text-slate-700 text-xs font-medium rounded-lg border border-slate-200/70 transition-all cursor-pointer disabled:opacity-50"
                     >
@@ -1183,7 +1201,7 @@ export default function App() {
                     <div className="flex justify-between items-start">
                       <button
                         onClick={() => scanAll('category', emp.category)}
-                        disabled={isScanning}
+                        disabled={isScanning || apiConfigured === false}
                         title={`Click to scan all ${emp.category} partner employers`}
                         className="text-[10px] font-bold text-blue-700 uppercase tracking-widest bg-blue-50 hover:bg-amber-100 hover:text-amber-800 px-2 py-0.5 rounded flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
                       >
@@ -1249,7 +1267,7 @@ export default function App() {
                   <div className="flex border-t border-slate-50 p-2 gap-2 bg-slate-50/50">
                     <button
                       onClick={() => scanEmployer(emp)}
-                      disabled={isScanning}
+                      disabled={isScanning || apiConfigured === false}
                       className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-white hover:bg-blue-50 text-slate-700 hover:text-blue-600 font-bold text-xs rounded-lg transition-all border border-slate-100 disabled:opacity-50 cursor-pointer"
                     >
                       <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin' : ''}`} />

@@ -23,7 +23,8 @@ export interface SourceDocument {
   text: string;
 }
 
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
+const MODEL = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
 const MAX_DOCUMENT_CHARS = 80_000;
 const MAX_SOURCE_DOCUMENTS = 5;
 const READER_TIMEOUT_MS = 12_000;

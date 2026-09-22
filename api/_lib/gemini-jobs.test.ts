@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DEFAULT_GEMINI_MODEL,
   extractLikelyCareerLinks,
   parseEvidenceBackedJobs,
   type SourceDocument,
 } from "./gemini-jobs.js";
+
+test("uses a stable current Gemini model by default", () => {
+  assert.equal(DEFAULT_GEMINI_MODEL, "gemini-3.6-flash");
+});
 
 const source: SourceDocument = {
   url: "https://example.org/careers",
