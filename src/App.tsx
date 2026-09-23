@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   collection, 
   onSnapshot, 
@@ -11,6 +11,7 @@ import {
   setDoc, 
   doc, 
   limit, 
+  startAfter,
   deleteDoc 
 } from 'firebase/firestore';
 import { 
@@ -45,7 +46,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { db } from './lib/firebase';
 import { INITIAL_EMPLOYERS } from './constants';
-import { scanJobsForEmployer, isGeminiConfigured } from './services/jobScanner';
+import { scanJobsForEmployer, isGeminiConfigured, isVerifiedScanResult } from './services/jobScanner';
 
 const ADMIN_PASSWORD = "twcWR2026";
 
@@ -81,7 +82,14 @@ const jobIdentity = (title: string, location?: string) =>
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [employers, setEmployers] = useState<Employer[]>([]);
-  const [jobs, setJobs] = useState<JobPosting[]>([]);
+  const [recentJobs, setRecentJobs] = useState<JobPosting[]>([]);
+  const [olderJobs, setOlderJobs] = useState<JobPosting[]>([]);
+  const [hasMoreJobs, setHasMoreJobs] = useState(false);
+  const [loadingMoreJobs, setLoadingMoreJobs] = useState(false);
+  const olderCursorRef = useRef<any>(null);
+  const jobs = useMemo(() => [...new Map(
+    [...olderJobs, ...recentJobs].map(job => [job.id, job])
+  ).values()], [recentJobs, olderJobs]);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [selectedRoleType, setSelectedRoleType] = useState('All');
@@ -192,7 +200,11 @@ export default function App() {
     const qJobs = query(collection(db, 'jobPostings'), orderBy('foundDate', 'desc'), limit(250));
     const unsubscribeJobs = onSnapshot(qJobs, (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as JobPosting));
-      setJobs(data);
+      setRecentJobs(data);
+      // Live refreshes can reorder jobs, so discard stale older pages and reset their cursor.
+      setOlderJobs([]);
+      olderCursorRef.current = snapshot.docs.at(-1) || null;
+      setHasMoreJobs(snapshot.docs.length === 250);
     }, (error) => {
       console.error("Jobs Listener Failed:", error);
     });
@@ -202,6 +214,26 @@ export default function App() {
       unsubscribeJobs();
     };
   }, []);
+
+  const loadMoreJobs = async () => {
+    const cursor = olderCursorRef.current;
+    if (!cursor || !hasMoreJobs || loadingMoreJobs) return;
+    setLoadingMoreJobs(true);
+    try {
+      const page = await getDocs(query(collection(db, 'jobPostings'),
+        orderBy('foundDate', 'desc'), startAfter(cursor), limit(250)));
+      if (olderCursorRef.current !== cursor) return; // A live refresh invalidated this page.
+      setOlderJobs(previous => [...previous,
+        ...page.docs.map(doc => ({ id: doc.id, ...doc.data() } as JobPosting))]);
+      olderCursorRef.current = page.docs.at(-1) || null;
+      setHasMoreJobs(page.docs.length === 250);
+    } catch (error) {
+      console.error('Could not load older job postings:', error);
+      setScanError('Could not load older postings. Please retry.');
+    } finally {
+      setLoadingMoreJobs(false);
+    }
+  };
 
   const seedEmployers = async () => {
     try {
@@ -270,10 +302,6 @@ export default function App() {
 
   const scanAll = async (mode: 'all' | 'unscanned' | 'category' = 'unscanned', categoryName?: string) => {
     if (isScanning) return;
-    if (apiConfigured === false) {
-      setScanError("Scanning is unavailable until GEMINI_API_KEY is configured in the server environment.");
-      return;
-    }
 
     let targetEmployers: Employer[] = [];
     let scanScopeTitle = '';
@@ -355,6 +383,9 @@ export default function App() {
             .map(d => (d.data().title || '').trim())
             .filter(Boolean))];
           const scanResult = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+          if (!isVerifiedScanResult(scanResult)) {
+            throw new Error(scanResult.warning || 'Could not verify current openings from the official source.');
+          }
           const foundJobs = scanResult.jobs;
           let employerNewJobs = 0;
           let employerRefreshedJobs = 0;
@@ -429,7 +460,7 @@ export default function App() {
     setCooldownCountdown(null);
     if (!abortControllerRef.current) {
       setScanError(scanFailedCount > 0
-        ? `${scanFailedCount} employer scan(s) could not use Gemini. Official ATS scans continued. Last error: ${lastScanFailure}`
+        ? `${scanFailedCount} employer scan(s) could not be verified. Verified scans continued; unverified partners were not marked as scanned. Last error: ${lastScanFailure}`
         : null);
       setScanSuccessMsg(`Scan complete: Synced ${scanSucceededCount} of ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
     }
@@ -439,10 +470,6 @@ export default function App() {
 
   const scanEmployer = async (employer: Employer) => {
     if (isScanning) return;
-    if (apiConfigured === false) {
-      setScanError("Scanning is unavailable until GEMINI_API_KEY is configured in the server environment.");
-      return;
-    }
     setIsScanning(true);
     setScanError(null);
     setScanSuccessMsg(null);
@@ -475,6 +502,9 @@ export default function App() {
           .map(d => (d.data().title || '').trim())
           .filter(Boolean))];
         const scanResult = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+        if (!isVerifiedScanResult(scanResult)) {
+          throw new Error(scanResult.warning || 'Could not verify current openings from the official source.');
+        }
         const foundJobs = scanResult.jobs;
         scanWarning = scanResult.warning;
         totalFound = foundJobs.length;
@@ -784,7 +814,7 @@ export default function App() {
               <CheckCircle2 className="w-6 h-6 text-emerald-600" />
             </div>
             <div>
-              <p className="text-sm text-slate-500 font-medium">Active Postings</p>
+              <p className="text-sm text-slate-500 font-medium">Loaded Postings{hasMoreJobs ? ' (more available)' : ''}</p>
               <p className="text-2xl font-bold text-slate-900">{jobs.length}</p>
             </div>
           </div>
@@ -829,10 +859,10 @@ export default function App() {
                 {selectedCategory !== 'All' && (
                   <button
                     onClick={() => scanAll('category', selectedCategory)}
-                    disabled={isScanning || apiConfigured === false}
+                    disabled={isScanning}
                     title={`Scan only employers in ${selectedCategory} (fast & quota-safe)`}
                     className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
-                      isScanning || apiConfigured === false
+                      isScanning
                         ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                         : 'bg-amber-500 hover:bg-amber-600 text-white shadow-amber-200'
                     }`}
@@ -844,10 +874,10 @@ export default function App() {
 
                 <button
                   onClick={() => scanAll('unscanned')}
-                  disabled={isScanning || apiConfigured === false}
+                  disabled={isScanning}
                   title="Scan partners not scanned in the last 24 hours (fastest & free-tier friendly)"
                   className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
-                    isScanning || apiConfigured === false
+                    isScanning
                       ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                       : 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-200'
                   }`}
@@ -857,10 +887,10 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => scanAll('all')}
-                  disabled={isScanning || apiConfigured === false}
+                  disabled={isScanning}
                   title="Force re-scan of all 44 employer partners with safe free-tier rate-pacing"
                   className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all border text-sm cursor-pointer ${
-                    isScanning || apiConfigured === false
+                    isScanning
                       ? 'border-slate-200 text-slate-300 cursor-not-allowed bg-slate-50' 
                       : 'border-slate-200 hover:bg-slate-50 text-slate-700 bg-white'
                   }`}
@@ -874,8 +904,8 @@ export default function App() {
               <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-amber-800 text-xs shadow-sm">
                 <KeyRound className="w-4 h-4 flex-shrink-0" />
                 <div>
-                  <span className="font-bold uppercase tracking-wider block mb-0.5">Scanning is not configured</span>
-                  Add <code className="font-mono font-bold">GEMINI_API_KEY</code> to the server environment, then reload this page.
+                  <span className="font-bold uppercase tracking-wider block mb-0.5">Gemini extraction is not configured</span>
+                  Official ATS scans can still run. Other employers require <code className="font-mono font-bold">GEMINI_API_KEY</code> in the server environment.
                 </div>
               </div>
             )}
@@ -918,7 +948,7 @@ export default function App() {
                     <button
                       key={cat}
                       onClick={() => scanAll('category', cat)}
-                      disabled={isScanning || apiConfigured === false}
+                      disabled={isScanning}
                       title={`Quick scan ${cat} (${count} partners) - ~${Math.max(count * 6, 10)} seconds`}
                       className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 hover:bg-amber-50 hover:text-amber-700 hover:border-amber-300 text-slate-700 text-xs font-medium rounded-lg border border-slate-200/70 transition-all cursor-pointer disabled:opacity-50"
                     >
@@ -1076,7 +1106,7 @@ export default function App() {
                 <h3 className="text-lg font-semibold text-slate-900">No matching jobs found</h3>
                 <p className="text-slate-500 max-w-sm mx-auto mt-1 mb-4 text-sm">
                   {jobs.length > 0 
-                    ? `There are ${jobs.length} total active postings in the database, but none match the current filter criteria.` 
+                    ? `None of the ${jobs.length} loaded postings match your filters.${hasMoreJobs ? ' Older postings may still match; load more below.' : ''}`
                     : "No job postings in the database yet. Click 'Scan Outdated' or 'Scan All' above to discover current openings."}
                 </p>
                 {(searchTerm || selectedCategory !== 'All' || selectedRoleType !== 'All' || selectedCity !== 'All' || selectedTimeframe !== 'all') && (
@@ -1168,6 +1198,15 @@ export default function App() {
                 ))}
               </div>
             )}
+            {hasMoreJobs && (
+              <button
+                onClick={loadMoreJobs}
+                disabled={loadingMoreJobs}
+                className="mx-auto px-5 py-2.5 bg-blue-50 text-blue-700 hover:bg-blue-100 font-semibold text-sm rounded-xl disabled:opacity-50"
+              >
+                {loadingMoreJobs ? 'Loading older postings...' : 'Load more postings (up to 250)'}
+              </button>
+            )}
           </div>
         ) : (
           <div className="space-y-4">
@@ -1194,7 +1233,7 @@ export default function App() {
                     <div className="flex justify-between items-start">
                       <button
                         onClick={() => scanAll('category', emp.category)}
-                        disabled={isScanning || apiConfigured === false}
+                        disabled={isScanning}
                         title={`Click to scan all ${emp.category} partner employers`}
                         className="text-[10px] font-bold text-blue-700 uppercase tracking-widest bg-blue-50 hover:bg-amber-100 hover:text-amber-800 px-2 py-0.5 rounded flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
                       >
@@ -1260,7 +1299,7 @@ export default function App() {
                   <div className="flex border-t border-slate-50 p-2 gap-2 bg-slate-50/50">
                     <button
                       onClick={() => scanEmployer(emp)}
-                      disabled={isScanning || apiConfigured === false}
+                      disabled={isScanning}
                       className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-white hover:bg-blue-50 text-slate-700 hover:text-blue-600 font-bold text-xs rounded-lg transition-all border border-slate-100 disabled:opacity-50 cursor-pointer"
                     >
                       <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin' : ''}`} />

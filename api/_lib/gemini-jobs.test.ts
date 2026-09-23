@@ -12,6 +12,7 @@ import {
   scanJobsForEmployer,
   type SourceDocument,
 } from "./gemini-jobs.js";
+import { isVerifiedScanResult } from "../../src/services/jobScanner.js";
 
 test("uses a stable current Gemini model by default", () => {
   assert.equal(DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite");
@@ -52,6 +53,14 @@ test("retries Gemini 503 twice but never retries free-tier quota errors", async 
     throw { status: 429 };
   }, 0), (error: any) => error.status === 429);
   assert.equal(attempts, 1);
+});
+
+test("neither individual nor group scans treat unverified empty results as success", () => {
+  assert.equal(isVerifiedScanResult({ jobs: [], source: "no-jobs-found", authoritative: false,
+    warning: "Reader unavailable" }), false);
+  assert.equal(isVerifiedScanResult({ jobs: [], source: "official-page", authoritative: true }), true);
+  assert.equal(isVerifiedScanResult({ jobs: [{ title: "Open job" }], source: "official-page",
+    authoritative: true }), true);
 });
 
 const source: SourceDocument = {
@@ -166,6 +175,23 @@ test("maps only local currently listed Taleo jobs to official detail pages", () 
   }]);
 });
 
+test("uses School District of Philadelphia's official Taleo school locations", () => {
+  const board = "https://aa080.taleo.net/careersection/sdp_external_career_section/jobsearch.ftl";
+  const payload = { requisitionList: [
+    { contestNo: "50032551", locationsColumns: [1], column: ["7-8 Math Teacher",
+      '["Alternative Middle Years at James Martin (5430)"]', "Sep 23, 2026"] },
+    { contestNo: "50032552", locationsColumns: [1], column: ["Missing location", "[]", "Sep 23, 2026"] },
+    { contestNo: "50032553", locationsColumns: [1], column: ["Other state", '["United States-Massachusetts-Boston"]', "Sep 23, 2026"] },
+  ] };
+  assert.deepEqual(parseTaleoJobs(payload, board), []);
+  const jobs = parseTaleoJobs(payload, board, true);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].city, "Philadelphia");
+  assert.match(jobs[0].location, /James Martin.*Philadelphia, PA/);
+  assert.match(jobs[0].url, /sdp_external_career_section\/jobdetail\.ftl\?job=50032551/);
+  assert.deepEqual(parseTaleoJobs(payload, "https://other.taleo.net/careersection/other/jobsearch.ftl", true), []);
+});
+
 test("follows Temple's official search page and combines paginated Taleo boards without Gemini", async () => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.GEMINI_API_KEY;
@@ -199,6 +225,28 @@ test("follows Temple's official search page and combines paginated Taleo boards 
     assert.equal(result.source, "official-page");
     assert.equal(result.jobs.length, 4);
     assert.ok(requests.some((url) => url.includes("/rest/jobboard/searchjobs")));
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
+});
+
+test("replaces verified stale career URLs stored on existing employers", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(String(input));
+    return new Response("Official site currently unavailable", { status: 503 });
+  };
+  try {
+    await scanJobsForEmployer("University of Pennsylvania (UPenn)", "https://careers.upenn.edu/");
+    await scanJobsForEmployer("World Affairs Council", "https://wacphila.org/about/careers/");
+    assert.ok(requests.some((url) => url === "https://www.hr.upenn.edu/PennHR/careers-at-penn"));
+    assert.ok(requests.some((url) => url === "https://wacphila.org/join-our-team/"));
+    assert.equal(requests.some((url) => url.includes("careers.upenn.edu/")), false);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
@@ -261,6 +309,37 @@ test("discovers Rivers Casino's official UKG board from its careers page", () =>
   assert.deepEqual(links, [
     "https://rushst.rec.pro.ukg.net/RIV1014RIVCA/JobBoard/27a20bf0-126e-44c7-a462-00944f601b0c/?q=&f4=location",
   ]);
+});
+
+test("finds Rivers UKG jobs in official HTML even if the intermediary Reader fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    requests.push(url);
+    if (url === "https://www.riverscasino.com/philadelphia/careers") return new Response(
+      '<html><body><h1>Rivers Casino Philadelphia Careers</h1><a href="https://rushst.rec.pro.ukg.net/RIV1014RIVCA/JobBoard/27a20bf0-126e-44c7-a462-00944f601b0c/?q=&amp;f4=location">Open Positions</a></body></html>',
+      { headers: { "Content-Type": "text/html" } });
+    if (url.includes("/JobBoardView/LoadSearchResults")) return Response.json({ opportunities: [{
+      Id: "8d27e1ef-97d9-416a-9139-075f06aac400", Title: "PT Cashier Flipt", FullTime: false,
+      Locations: [{ Address: { City: "Philadelphia", State: { Code: "PA" }, PostalCode: "19125" } }],
+    }] });
+    if (url.startsWith("https://r.jina.ai/")) return new Response("Reader unavailable", { status: 503 });
+    return new Response("not found", { status: 404 });
+  };
+  try {
+    const result = await scanJobsForEmployer("Rivers Casino", "https://www.riverscasino.com/philadelphia/careers");
+    assert.equal(result.jobs.length, 1);
+    assert.equal(result.source, "official-page");
+    assert.equal(result.authoritative, true);
+    assert.equal(requests.some((url) => url.startsWith("https://r.jina.ai/")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
 });
 
 test("maps official UKG opportunities without including other casino cities or fake positions", () => {

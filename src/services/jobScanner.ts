@@ -15,6 +15,11 @@ export interface JobScanResult {
   warning?: string;
 }
 
+/** An unavailable source is not proof that an employer has zero openings. */
+export function isVerifiedScanResult(result: JobScanResult): boolean {
+  return result.jobs.length > 0 || result.authoritative;
+}
+
 /**
  * Checks if the backend Gemini API is configured via Vercel status route.
  */

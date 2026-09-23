@@ -1,4 +1,5 @@
 import { GoogleGenAI, Type } from "@google/genai";
+import { INITIAL_EMPLOYERS } from "../../src/constants.js";
 
 export interface ScannedJob {
   title: string;
@@ -29,6 +30,12 @@ const SEARCH_GROUNDING_ENABLED = process.env.GEMINI_ENABLE_SEARCH_GROUNDING === 
 const MAX_DOCUMENT_CHARS = 80_000;
 const MAX_SOURCE_DOCUMENTS = 5;
 const READER_TIMEOUT_MS = 12_000;
+const DIRECT_TIMEOUT_MS = 7_000;
+const OFFICIAL_HOSTS = new Set(INITIAL_EMPLOYERS.map((employer) => new URL(employer.website).hostname.toLowerCase()));
+const LEGACY_CAREER_URLS = new Map([
+  ["https://careers.upenn.edu/", "https://www.hr.upenn.edu/PennHR/careers-at-penn"],
+  ["https://wacphila.org/about/careers", "https://wacphila.org/join-our-team/"],
+]);
 const ATS_HOST_PATTERN = /(?:^|\.)(?:myworkdayjobs\.com|greenhouse\.io|lever\.co|taleo\.net|oraclecloud\.com|icims\.com|smartrecruiters\.com|ultipro\.com|ukg\.com|bamboohr\.com|adp\.com|jobvite\.com|paylocity\.com|dayforcehcm\.com|successfactors\.com|sapsf\.com)$/i;
 
 export function hasGeminiApiKey(): boolean {
@@ -306,7 +313,7 @@ async function fetchUkgJobs(boardUrl: string): Promise<ScannedJob[]> {
 }
 
 /** Taleo's public search response contains open requisitions, including their actual board IDs. */
-export function parseTaleoJobs(payload: unknown, boardUrl: string): ScannedJob[] {
+export function parseTaleoJobs(payload: unknown, boardUrl: string, districtLocation = false): ScannedJob[] {
   const requisitions = (payload as any)?.requisitionList;
   if (!Array.isArray(requisitions)) return [];
   const board = new URL(boardUrl);
@@ -319,26 +326,30 @@ export function parseTaleoJobs(payload: unknown, boardUrl: string): ScannedJob[]
     if (!title || !/^[\w-]{1,50}$/.test(contestNo)) continue;
     let locations: unknown;
     try {
-      locations = JSON.parse(String(columns[2] || "[]"));
+      const locationIndex = Array.isArray(requisition.locationsColumns) ? requisition.locationsColumns[0] : 2;
+      locations = JSON.parse(String(columns[locationIndex] || "[]"));
     } catch {
       continue;
     }
     if (!Array.isArray(locations)) continue;
     const local = locations.map((location) => String(location).match(/^United States-(Pennsylvania|New Jersey)-(.+)$/i))
       .find((parts) => parts && isGreaterPhiladelphiaLocation(parts[2], parts[1].toLowerCase() === "pennsylvania" ? "PA" : "NJ", ""));
-    if (!local) continue;
-    const city = local[2].trim();
-    const state = local[1].toLowerCase() === "pennsylvania" ? "PA" : "NJ";
+    if (!local && !(districtLocation && board.hostname === "aa080.taleo.net" &&
+        board.pathname.includes("/sdp_external_career_section/") && locations.length > 0 &&
+        locations.every((location) => !/^(?:United States|Canada)-/i.test(String(location))))) continue;
+    const city = local ? local[2].trim() : "Philadelphia";
+    const state = local ? local[1].toLowerCase() === "pennsylvania" ? "PA" : "NJ" : "PA";
+    const school = !local && districtLocation ? String(locations[0]).trim() : "";
     const detailUrl = new URL(board.pathname.replace(/jobsearch\.ftl$/i, "jobdetail.ftl"), board.origin);
     detailUrl.searchParams.set("job", contestNo);
     detailUrl.searchParams.set("lang", board.searchParams.get("lang") || "en");
-    jobs.push({ title, url: detailUrl.href, location: `${city}, ${state}`, city,
+    jobs.push({ title, url: detailUrl.href, location: school ? `${school}, ${city}, ${state}` : `${city}, ${state}`, city,
       roleType: "Not specified", postedDate: "", description: "" });
   }
   return jobs;
 }
 
-async function fetchTaleoJobs(boardUrl: string): Promise<ScannedJob[]> {
+async function fetchTaleoJobs(boardUrl: string, districtLocation = false): Promise<ScannedJob[]> {
   try {
     const board = new URL(boardUrl);
     if (!/(?:^|\.)taleo\.net$/i.test(board.hostname) ||
@@ -362,7 +373,7 @@ async function fetchTaleoJobs(boardUrl: string): Promise<ScannedJob[]> {
       });
       if (!response.ok) break;
       const payload = await response.json();
-      for (const job of parseTaleoJobs(payload, board.href)) jobs.set(job.url, job);
+      for (const job of parseTaleoJobs(payload, board.href, districtLocation)) jobs.set(job.url, job);
       const paging = payload?.pagingData;
       const count = Array.isArray(payload?.requisitionList) ? payload.requisitionList.length : 0;
       if (!count || !Number.isFinite(Number(paging?.pageSize)) ||
@@ -376,20 +387,19 @@ async function fetchTaleoJobs(boardUrl: string): Promise<ScannedJob[]> {
 }
 
 async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<ScannedJob[]> {
+  const adpBoards = new Set<string>();
+  const ukgBoards = new Set<string>();
   const taleoBoards = new Set<string>();
   for (const document of documents) {
     try {
-      const hostname = new URL(document.url).hostname.toLowerCase();
-      if (hostname === "adp.com" || hostname.endsWith(".adp.com")) {
-        const jobs = await fetchAdpJobs(document.url);
-        if (jobs.length > 0) return jobs;
-      }
-      if (hostname.endsWith(".rec.pro.ukg.net")) {
-        const jobs = await fetchUkgJobs(document.url);
-        if (jobs.length > 0) return jobs;
-      }
       for (const url of [document.url, ...extractLikelyCareerLinks(document)]) {
         const board = new URL(url);
+        const hostname = board.hostname.toLowerCase();
+        if (hostname === "adp.com" || hostname.endsWith(".adp.com")) adpBoards.add(board.href);
+        if (hostname.endsWith(".rec.pro.ukg.net")) {
+          const boardPath = board.pathname.match(/^\/(?:[^/]+)\/JobBoard\/[a-f\d-]{36}\//i);
+          if (boardPath) ukgBoards.add(new URL(boardPath[0], board.origin).href);
+        }
         if (/(?:^|\.)taleo\.net$/i.test(board.hostname) &&
             /^\/careersection\/[^/]+\/jobsearch\.ftl$/i.test(board.pathname)) taleoBoards.add(board.href);
       }
@@ -397,11 +407,55 @@ async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<Sc
       // Ignore malformed source URLs; normal evidence extraction remains available.
     }
   }
+  for (const boardUrl of [...adpBoards].slice(0, 4)) {
+    const jobs = await fetchAdpJobs(boardUrl);
+    if (jobs.length > 0) return jobs;
+  }
+  for (const boardUrl of [...ukgBoards].slice(0, 4)) {
+    const jobs = await fetchUkgJobs(boardUrl);
+    if (jobs.length > 0) return jobs;
+  }
   const jobs = new Map<string, ScannedJob>();
   for (const boardUrl of [...taleoBoards].slice(0, 4)) {
-    for (const job of await fetchTaleoJobs(boardUrl)) jobs.set(job.url, job);
+    const districtLocation = documents.some((document) => new URL(document.url).hostname === "jobs.philasd.org") &&
+      new URL(boardUrl).hostname === "aa080.taleo.net";
+    for (const job of await fetchTaleoJobs(boardUrl, districtLocation)) jobs.set(job.url, job);
   }
   return [...jobs.values()];
+}
+
+/** First-party HTML is enough to discover ATS links when the Reader is slow or unavailable. */
+async function fetchOfficialHtml(url: string): Promise<SourceDocument | null> {
+  const normalized = normalizeHttpUrl(url);
+  if (!normalized) return null;
+  const parsed = new URL(normalized);
+  if (parsed.protocol !== "https:" || !OFFICIAL_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+  try {
+    const initialHost = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const signal = AbortSignal.timeout(DIRECT_TIMEOUT_MS);
+    let current = parsed;
+    for (let redirects = 0; redirects <= 2; redirects += 1) {
+      const response = await fetch(current, {
+        headers: { Accept: "text/html" }, redirect: "manual", signal,
+      });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get("location");
+        if (!location) return null;
+        const next = new URL(location, current);
+        if (next.protocol !== "https:" || next.hostname.toLowerCase().replace(/^www\./, "") !== initialHost ||
+            next.username || next.password) return null;
+        current = next;
+        continue;
+      }
+      if (!response.ok || !/text\/html/i.test(response.headers.get("content-type") || "")) return null;
+      const text = (await response.text()).slice(0, 300_000);
+      return text.length >= 120 ? { url: current.href, text } : null;
+    }
+    return null;
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read official HTML for ${normalized}:`, error);
+    return null;
+  }
 }
 
 function extractDocumentUrls(document: SourceDocument): Set<string> {
@@ -605,7 +659,8 @@ async function collectCareerDocuments(root: SourceDocument): Promise<SourceDocum
       .slice(0, Math.min(2, remaining));
     batch.forEach((url) => visited.add(comparableUrl(url)));
 
-    const fetched = (await Promise.all(batch.map(fetchReadablePage)))
+    const fetched = (await Promise.all(batch.map(async (url) =>
+      await fetchReadablePage(url) || await fetchOfficialHtml(url))))
       .filter((document): document is SourceDocument => Boolean(document));
     documents.push(...fetched);
     frontier = fetched
@@ -724,17 +779,32 @@ export async function scanJobsForEmployer(
 
   let lastWarning = "No evidence-backed open positions were found.";
   let lastError: unknown = null;
-  const officialDocument = await fetchReadablePage(targetUrl);
-  let documents: SourceDocument[] = [];
+  const officialUrl = LEGACY_CAREER_URLS.get(comparableUrl(targetUrl)) || targetUrl;
+  const directDocument = await fetchOfficialHtml(officialUrl);
+  if (directDocument) {
+    const directJobs = await extractStructuredAtsJobs([directDocument]);
+    if (directJobs.length > 0) {
+      return { jobs: directJobs, source: "official-page", authoritative: true };
+    }
+  }
+  const officialDocument = await fetchReadablePage(officialUrl);
+  let documents: SourceDocument[] = directDocument ? [directDocument] : [];
   if (officialDocument) {
     try {
       documents = await collectCareerDocuments(officialDocument);
+      if (directDocument) documents.push(directDocument);
       const structuredJobs = await extractStructuredAtsJobs(documents);
       if (structuredJobs.length > 0) {
         return { jobs: structuredJobs, source: "official-page", authoritative: true };
       }
     } catch (error) {
       console.warn(`[Job scanner] Official-source discovery failed for ${employerName}:`, error);
+    }
+  } else if (directDocument) {
+    documents = await collectCareerDocuments(directDocument);
+    const structuredJobs = await extractStructuredAtsJobs(documents);
+    if (structuredJobs.length > 0) {
+      return { jobs: structuredJobs, source: "official-page", authoritative: true };
     }
   }
 
@@ -759,7 +829,7 @@ export async function scanJobsForEmployer(
 
   if (SEARCH_GROUNDING_ENABLED) {
     try {
-      const candidateUrls = await discoverCandidateUrls(ai, employerName, targetUrl);
+      const candidateUrls = await discoverCandidateUrls(ai, employerName, officialUrl);
       const candidateDocuments = (await Promise.all(candidateUrls.map(fetchReadablePage)))
         .filter((document): document is SourceDocument => Boolean(document));
       if (candidateDocuments.length > 0) {
@@ -775,7 +845,9 @@ export async function scanJobsForEmployer(
       console.warn(`[Job scanner] Grounded discovery failed for ${employerName}:`, error);
     }
   } else if (!lastError) {
-    lastWarning = "No evidence-backed regional openings were found on the employer's official pages. Paid search fallback is disabled.";
+    lastWarning = documents.length > 0
+      ? "Could not verify open regional positions from the available official pages. Paid search fallback is disabled; this does not mean the employer has no openings."
+      : "Could not read the employer's official careers page. Check its website URL; the scan was not verified.";
   }
 
   if (lastError) {
@@ -790,7 +862,7 @@ export async function scanJobsForEmployer(
   return {
     jobs: [],
     source: "no-jobs-found",
-    authoritative: Boolean(officialDocument),
+    authoritative: false,
     warning: lastWarning,
   };
 }
