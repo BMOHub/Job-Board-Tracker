@@ -76,6 +76,9 @@ export function describeGeminiError(error: unknown): string {
   if (/timeout|timed out|deadline|aborterror/.test(normalized)) {
     return "The Gemini request timed out before the scan completed. Please retry this employer.";
   }
+  if ([502, 503, 504].includes(status || 0)) {
+    return "Gemini is temporarily unavailable after retries. Try this employer again later; no paid upgrade is required for this error.";
+  }
   if (status === 400) {
     return `Gemini rejected the scan request (400) for model ${MODEL}. Check the Vercel function logs for the upstream validation message.`;
   }
@@ -302,7 +305,78 @@ async function fetchUkgJobs(boardUrl: string): Promise<ScannedJob[]> {
   }
 }
 
+/** Taleo's public search response contains open requisitions, including their actual board IDs. */
+export function parseTaleoJobs(payload: unknown, boardUrl: string): ScannedJob[] {
+  const requisitions = (payload as any)?.requisitionList;
+  if (!Array.isArray(requisitions)) return [];
+  const board = new URL(boardUrl);
+  const jobs: ScannedJob[] = [];
+  for (const requisition of requisitions) {
+    const columns = requisition?.column;
+    if (!Array.isArray(columns)) continue;
+    const title = String(columns[0] || "").trim();
+    const contestNo = String(requisition?.contestNo || "").trim();
+    if (!title || !/^[\w-]{1,50}$/.test(contestNo)) continue;
+    let locations: unknown;
+    try {
+      locations = JSON.parse(String(columns[2] || "[]"));
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(locations)) continue;
+    const local = locations.map((location) => String(location).match(/^United States-(Pennsylvania|New Jersey)-(.+)$/i))
+      .find((parts) => parts && isGreaterPhiladelphiaLocation(parts[2], parts[1].toLowerCase() === "pennsylvania" ? "PA" : "NJ", ""));
+    if (!local) continue;
+    const city = local[2].trim();
+    const state = local[1].toLowerCase() === "pennsylvania" ? "PA" : "NJ";
+    const detailUrl = new URL(board.pathname.replace(/jobsearch\.ftl$/i, "jobdetail.ftl"), board.origin);
+    detailUrl.searchParams.set("job", contestNo);
+    detailUrl.searchParams.set("lang", board.searchParams.get("lang") || "en");
+    jobs.push({ title, url: detailUrl.href, location: `${city}, ${state}`, city,
+      roleType: "Not specified", postedDate: "", description: "" });
+  }
+  return jobs;
+}
+
+async function fetchTaleoJobs(boardUrl: string): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    if (!/(?:^|\.)taleo\.net$/i.test(board.hostname) ||
+        !/^\/careersection\/[^/]+\/jobsearch\.ftl$/i.test(board.pathname)) return [];
+    const boardResponse = await fetch(board, { signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+    if (!boardResponse.ok) return [];
+    const html = await boardResponse.text();
+    const portalNo = html.match(/\bportalNo\s*:\s*['"](\d+)['"]/i)?.[1];
+    if (!portalNo) return [];
+    const endpoint = new URL("/careersection/rest/jobboard/searchjobs", board.origin);
+    endpoint.searchParams.set("lang", board.searchParams.get("lang") || "en");
+    endpoint.searchParams.set("portal", portalNo);
+    const jobs = new Map<string, ScannedJob>();
+    for (let page = 1; page <= 10; page += 1) {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json", Referer: board.href,
+          tz: "0", tzname: "UTC" },
+        body: JSON.stringify({ pageNo: page }),
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+      });
+      if (!response.ok) break;
+      const payload = await response.json();
+      for (const job of parseTaleoJobs(payload, board.href)) jobs.set(job.url, job);
+      const paging = payload?.pagingData;
+      const count = Array.isArray(payload?.requisitionList) ? payload.requisitionList.length : 0;
+      if (!count || !Number.isFinite(Number(paging?.pageSize)) ||
+          page * Number(paging.pageSize) >= Number(paging?.totalCount || 0)) break;
+    }
+    return [...jobs.values()];
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read Taleo board ${boardUrl}:`, error);
+    return [];
+  }
+}
+
 async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<ScannedJob[]> {
+  const taleoBoards = new Set<string>();
   for (const document of documents) {
     try {
       const hostname = new URL(document.url).hostname.toLowerCase();
@@ -314,11 +388,20 @@ async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<Sc
         const jobs = await fetchUkgJobs(document.url);
         if (jobs.length > 0) return jobs;
       }
+      for (const url of [document.url, ...extractLikelyCareerLinks(document)]) {
+        const board = new URL(url);
+        if (/(?:^|\.)taleo\.net$/i.test(board.hostname) &&
+            /^\/careersection\/[^/]+\/jobsearch\.ftl$/i.test(board.pathname)) taleoBoards.add(board.href);
+      }
     } catch {
       // Ignore malformed source URLs; normal evidence extraction remains available.
     }
   }
-  return [];
+  const jobs = new Map<string, ScannedJob>();
+  for (const boardUrl of [...taleoBoards].slice(0, 4)) {
+    for (const job of await fetchTaleoJobs(boardUrl)) jobs.set(job.url, job);
+  }
+  return [...jobs.values()];
 }
 
 function extractDocumentUrls(document: SourceDocument): Set<string> {
@@ -581,25 +664,38 @@ const extractionSchema = {
   },
 };
 
+/** Retry only transient upstream failures; quota and authentication must not be retried. */
+export async function requestGeminiWithRetry<T>(request: () => Promise<T>, delayMs = 600): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await request();
+    } catch (error) {
+      const candidate = error as { status?: number; code?: number };
+      if (attempt >= 2 || ![502, 503, 504].includes(Number(candidate?.status || candidate?.code))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs * 2 ** attempt));
+    }
+  }
+}
+
 async function extractJobs(ai: GoogleGenAI, employerName: string, documents: SourceDocument[]): Promise<ScannedJob[]> {
   if (documents.length === 0) return [];
-  const response = await ai.models.generateContent({
+  const response = await requestGeminiWithRetry(() => ai.models.generateContent({
     model: MODEL,
     contents: buildExtractionPrompt(employerName, documents),
     config: {
       responseMimeType: "application/json",
       responseSchema: extractionSchema,
     },
-  });
+  }));
   return parseEvidenceBackedJobs(response.text || "", documents);
 }
 
 async function discoverCandidateUrls(ai: GoogleGenAI, employerName: string, website: string): Promise<string[]> {
-  const response: any = await ai.models.generateContent({
+  const response: any = await requestGeminiWithRetry(() => ai.models.generateContent({
     model: MODEL,
     contents: `Find official, currently open job-detail or job-search pages for "${employerName}" in Greater Philadelphia. The employer website is ${website}. Focus on the employer's site and its official applicant-tracking system. Do not use job-description aggregators or old cached postings.`,
     config: { tools: [{ googleSearch: {} }] },
-  });
+  }));
 
   const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
   const urls = new Set<string>();
@@ -616,16 +712,6 @@ export async function scanJobsForEmployer(
   website: string,
   _existingTitles: string[] = [],
 ): Promise<ScanJobsResult> {
-  const ai = getAIClient();
-  if (!ai) {
-    return {
-      jobs: [],
-      source: "no-jobs-found",
-      authoritative: false,
-      error: "GEMINI_API_KEY is missing or invalid in the server environment.",
-    };
-  }
-
   const targetUrl = normalizeHttpUrl(website);
   if (!targetUrl) {
     return {
@@ -639,13 +725,26 @@ export async function scanJobsForEmployer(
   let lastWarning = "No evidence-backed open positions were found.";
   let lastError: unknown = null;
   const officialDocument = await fetchReadablePage(targetUrl);
+  let documents: SourceDocument[] = [];
   if (officialDocument) {
     try {
-      const documents = await collectCareerDocuments(officialDocument);
+      documents = await collectCareerDocuments(officialDocument);
       const structuredJobs = await extractStructuredAtsJobs(documents);
       if (structuredJobs.length > 0) {
         return { jobs: structuredJobs, source: "official-page", authoritative: true };
       }
+    } catch (error) {
+      console.warn(`[Job scanner] Official-source discovery failed for ${employerName}:`, error);
+    }
+  }
+
+  const ai = getAIClient();
+  if (!ai) {
+    return { jobs: [], source: "no-jobs-found", authoritative: false,
+      error: "GEMINI_API_KEY is missing or invalid in the server environment." };
+  }
+  if (documents.length > 0) {
+    try {
       const jobs = await extractJobs(ai, employerName, documents);
       lastError = null;
       if (jobs.length > 0) {

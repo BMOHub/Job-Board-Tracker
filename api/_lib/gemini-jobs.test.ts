@@ -6,7 +6,10 @@ import {
   extractLikelyCareerLinks,
   parseAdpJobs,
   parseEvidenceBackedJobs,
+  parseTaleoJobs,
   parseUkgJobs,
+  requestGeminiWithRetry,
+  scanJobsForEmployer,
   type SourceDocument,
 } from "./gemini-jobs.js";
 
@@ -22,6 +25,7 @@ test("turns Gemini authentication and quota failures into actionable safe messag
   const quotaMessage = describeGeminiError({ status: 429, message: "RESOURCE_EXHAUSTED" });
   assert.match(quotaMessage, /free Gemini quota or rate limit/i);
   assert.doesNotMatch(quotaMessage, /billing/i);
+  assert.match(describeGeminiError({ status: 503 }), /temporarily unavailable after retries/i);
 });
 
 test("reports an unavailable configured model without returning the raw SDK error", () => {
@@ -32,6 +36,22 @@ test("reports an unavailable configured model without returning the raw SDK erro
 
   assert.match(message, /gemini-3.5-flash-lite is unavailable/i);
   assert.doesNotMatch(message, /secret-123/);
+});
+
+test("retries Gemini 503 twice but never retries free-tier quota errors", async () => {
+  let attempts = 0;
+  assert.equal(await requestGeminiWithRetry(async () => {
+    attempts += 1;
+    if (attempts < 3) throw { status: 503 };
+    return "recovered";
+  }, 0), "recovered");
+  assert.equal(attempts, 3);
+  attempts = 0;
+  await assert.rejects(requestGeminiWithRetry(async () => {
+    attempts += 1;
+    throw { status: 429 };
+  }, 0), (error: any) => error.status === 429);
+  assert.equal(attempts, 1);
 });
 
 const source: SourceDocument = {
@@ -130,6 +150,60 @@ test("discovers ATS links in raw HTML returned by the reader fallback", () => {
   assert.deepEqual(links, [
     "https://temple.taleo.net/careersection/jobs/jobsearch.ftl?lang=en",
   ]);
+});
+
+test("maps only local currently listed Taleo jobs to official detail pages", () => {
+  const jobs = parseTaleoJobs({ requisitionList: [
+    { contestNo: "26002340", column: ["Driver/Groundskeeper", "26002340", '["United States-Pennsylvania-Philadelphia"]'] },
+    { contestNo: "26002341", column: ["Boston role", "26002341", '["United States-Massachusetts-Boston"]'] },
+    { contestNo: "26002342", column: ["Unspecified PA", "26002342", '["United States-Location INSIDE of PA"]'] },
+    { contestNo: "bad/value", column: ["Unsafe URL", "", '["United States-Pennsylvania-Philadelphia"]'] },
+  ] }, "https://temple.taleo.net/careersection/tu_ex_staff/jobsearch.ftl?lang=en");
+  assert.deepEqual(jobs, [{
+    title: "Driver/Groundskeeper", city: "Philadelphia", location: "Philadelphia, PA",
+    url: "https://temple.taleo.net/careersection/tu_ex_staff/jobdetail.ftl?job=26002340&lang=en",
+    roleType: "Not specified", postedDate: "", description: "",
+  }]);
+});
+
+test("follows Temple's official search page and combines paginated Taleo boards without Gemini", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    requests.push(url);
+    if (url.endsWith("https://careers.temple.edu/")) return new Response(
+      "Temple University Careers. Search official open positions for staff and faculty. " +
+      "[Search and Apply For Jobs](https://careers.temple.edu/careers-temple/search-and-apply-jobs) More information.");
+    if (url.endsWith("https://careers.temple.edu/careers-temple/search-and-apply-jobs")) return new Response(
+      "[External Candidate](https://temple.taleo.net/careersection/tu_ex_staff/jobsearch.ftl?lang=en)\n" +
+      "[Faculty Jobs](https://temple.taleo.net/careersection/tu_ex_faculty/jobsearch.ftl?lang=en)\n" +
+      "[Adjunct Jobs](https://temple.taleo.net/careersection/tu_ex_adjunct/jobsearch.ftl?lang=en)");
+    if (url.includes("/careersection/") && url.includes("/jobsearch.ftl")) return new Response(
+      "<script>var settings={portalNo: '8100123629'};</script>");
+    if (url.includes("/rest/jobboard/searchjobs")) {
+      const board = String(init?.headers && (init.headers as Record<string, string>).Referer || "");
+      const pageNo = JSON.parse(String(init?.body)).pageNo;
+      const prefix = board.includes("staff") ? "staff" : board.includes("faculty") ? "faculty" : "adjunct";
+      const requisitionList = pageNo === 1 ? [{ contestNo: `${prefix}-1`,
+        column: [`${prefix} job`, "", '["United States-Pennsylvania-Philadelphia"]'] }] :
+        prefix === "staff" ? [{ contestNo: "staff-2", column: ["Second staff job", "", '["United States-Pennsylvania-Philadelphia"]'] }] : [];
+      return Response.json({ requisitionList, pagingData: { pageSize: 1, totalCount: prefix === "staff" ? 2 : 1 } });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  try {
+    const result = await scanJobsForEmployer("Temple University", "https://careers.temple.edu/");
+    assert.equal(result.source, "official-page");
+    assert.equal(result.jobs.length, 4);
+    assert.ok(requests.some((url) => url.includes("/rest/jobboard/searchjobs")));
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
 });
 
 test("extracts only Greater Philadelphia jobs from an official ADP response", () => {
