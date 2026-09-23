@@ -31,10 +31,19 @@ const MAX_DOCUMENT_CHARS = 80_000;
 const MAX_SOURCE_DOCUMENTS = 5;
 const READER_TIMEOUT_MS = 12_000;
 const DIRECT_TIMEOUT_MS = 7_000;
+const BANK_SEARCH_ORIGIN = "https://careers.bankofamerica.com";
+const SANTANDER_SEARCH = "https://www.santandercareers.com/search-jobs/Philadelphia%2C%20PA/1771/4/6252001-6254927/39x9526/-75x1636/50/2";
+const SEPTA_ALL_JOBS = "https://jobs.septa.org/go/View-All-Jobs/8606400/";
+// PHMC links to this same official UKG board from its careers page. Keep it as
+// a direct path so intermittent corporate-site responses do not hide openings.
+const PHMC_BOARD = "https://recruiting.ultipro.com/PUB1002/JobBoard/c8784846-358b-1bec-45e9-f994af5fccee/";
 const OFFICIAL_HOSTS = new Set(INITIAL_EMPLOYERS.map((employer) => new URL(employer.website).hostname.toLowerCase()));
 const LEGACY_CAREER_URLS = new Map([
   ["https://careers.upenn.edu/", "https://www.hr.upenn.edu/PennHR/careers-at-penn"],
   ["https://wacphila.org/about/careers", "https://wacphila.org/join-our-team/"],
+  ["https://www.acelero.net/careers", "https://acelerolearning.com/careers/"],
+  ["https://www.centercityphila.org/about/jobs", "https://centercityphila.org/who-we-are/careers/"],
+  ["https://www.justborn.com/careers", "https://www.justborn.com/join-our-team"],
 ]);
 const ATS_HOST_PATTERN = /(?:^|\.)(?:myworkdayjobs\.com|greenhouse\.io|lever\.co|taleo\.net|oraclecloud\.com|icims\.com|smartrecruiters\.com|ultipro\.com|ukg\.com|bamboohr\.com|adp\.com|jobvite\.com|paylocity\.com|dayforcehcm\.com|successfactors\.com|sapsf\.com)$/i;
 
@@ -138,13 +147,338 @@ function isGreaterPhiladelphiaLocation(city: string, state: string, postalCode: 
     "philadelphia", "wayne", "radnor", "king of prussia", "conshohocken", "malvern",
     "west chester", "chester", "media", "bala cynwyd", "bryn mawr", "fort washington",
     "horsham", "blue bell", "plymouth meeting", "norristown", "lansdale", "doylestown",
-    "newtown", "yardley", "bensalem", "trevose", "exton", "paoli", "berwyn",
-    "jenkintown", "willow grove", "camden", "cherry hill", "mount laurel", "moorestown",
+    "newtown", "yardley", "bensalem", "trevose", "feasterville-trevose", "exton", "paoli", "berwyn",
+    "jenkintown", "willow grove", "camden", "cherry hill", "mount laurel", "moorestown", "haddonfield",
+    "upper darby", "springfield", "broomall", "glen mills", "warrington", "southampton", "lahaska",
+    "elkins park gardens", "wyncote", "langhorne", "borough of langhorne",
+    "harleysville", "north wales",
   ];
-  if (localCities.includes(normalizedCity)) {
-    return true;
+  if (normalizedState === "NJ") {
+    return ["camden", "cherry hill", "mount laurel", "moorestown", "haddonfield"].includes(normalizedCity) ||
+      /^(080|081)/.test(postalCode.trim());
   }
-  return normalizedState === "NJ" && /^(080|081)/.test(postalCode.trim());
+  return localCities.includes(normalizedCity);
+}
+
+/** Bank of America's public careers search is populated by this first-party JSON feed. */
+export function parseBankOfAmericaJobs(payload: unknown): ScannedJob[] {
+  const listings = (payload as { jobsList?: unknown })?.jobsList;
+  if (!Array.isArray(listings)) return [];
+
+  const jobs = new Map<string, ScannedJob>();
+  for (const listing of listings) {
+    const title = String(listing?.postingTitle || "").trim();
+    const path = String(listing?.jcrURL || "").trim();
+    if (!title || !/^\/en-us\/job-detail\/\d{4,}\/[^/?#]+$/i.test(path)) continue;
+    const primaryState = String(listing?.state || "").trim();
+    const state = primaryState === "Pennsylvania" ? "PA" : primaryState === "New Jersey" ? "NJ" : "";
+    const city = String(listing?.city || "").trim();
+    const primaryLocal = listing?.country === "United States" &&
+      isGreaterPhiladelphiaLocation(city, state, "") &&
+      (state !== "NJ" || ["camden", "cherry hill", "mount laurel", "moorestown"].includes(normalizeEvidence(city)));
+    const otherLocations = String(listing?.additionalLocations || "").split(",");
+    const localSecondary = otherLocations.map((location) =>
+      location.match(/^US - (PA|NJ) - (.+?) - /i))
+      .find((parts) => parts && isGreaterPhiladelphiaLocation(parts[2], parts[1], "") &&
+        (parts[1].toUpperCase() !== "NJ" || ["camden", "cherry hill", "mount laurel", "moorestown"].includes(normalizeEvidence(parts[2]))));
+    if (!primaryLocal && !localSecondary) continue;
+
+    const localCity = primaryLocal ? city : localSecondary![2].trim();
+    const localState = primaryLocal ? state : localSecondary![1].toUpperCase();
+    const url = new URL(path, BANK_SEARCH_ORIGIN).href;
+    jobs.set(url, { title, url, city: localCity, location: `${localCity}, ${localState}`,
+      roleType: "Not specified", postedDate: String(listing?.postedDate || "").trim(), description: "" });
+  }
+  return [...jobs.values()];
+}
+
+async function fetchBankOfAmericaJobs(): Promise<ScannedJob[]> {
+  try {
+    const jobs = new Map<string, ScannedJob>();
+    for (const state of ["Pennsylvania", "New Jersey"]) {
+      let total = 0;
+      let initialTotal: number | null = null;
+      for (let start = 0; start === 0 || start < total; start += 100) {
+        // Fail closed if the API changes or a page is unavailable: partial lists aren't complete scans.
+        if (start >= 1_000) return [];
+        const endpoint = new URL("/services/jobssearchservlet", BANK_SEARCH_ORIGIN);
+        for (const [key, value] of Object.entries({ search: "jobsByStateCountry", state,
+          country: "United States", start: String(start), rows: String(start + 100) })) endpoint.searchParams.set(key, value);
+        const response = await fetch(endpoint, { headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+        if (!response.ok) return [];
+        const payload = await response.json();
+        if (!Array.isArray(payload?.jobsList) || !Number.isSafeInteger(payload?.totalMatches) ||
+            payload.totalMatches < 0 || (initialTotal !== null && initialTotal !== payload.totalMatches) ||
+            payload.jobsList.length < Math.min(100, payload.totalMatches - start)) return [];
+        initialTotal = payload.totalMatches;
+        total = payload.totalMatches;
+        for (const job of parseBankOfAmericaJobs(payload)) jobs.set(job.url, job);
+      }
+    }
+    return [...jobs.values()];
+  } catch (error) {
+    console.warn("[Job scanner] Bank of America official job feed unavailable:", error);
+    return [];
+  }
+}
+
+/** The official Santander search renders a paginated list of currently open jobs in HTML. */
+export function parseSantanderJobs(html: string): ScannedJob[] {
+  const region = html.match(/<ul\b[^>]*id="search-results-jobs"[^>]*>/i);
+  if (!region) return [];
+  const end = html.indexOf('<nav id="pagination-bottom"', region.index);
+  if (end < 0) return [];
+  const section = html.slice(region.index, end);
+  const jobs: ScannedJob[] = [];
+  const entries = section.split(/<li\s+class="search-results-list__item"[^>]*>/i).slice(1);
+  for (const entry of entries) {
+    const match = entry.match(/<a\s+class="search-results-list__job-link"\s+href="([^"]+)"[^>]*>([^<]+)<\/a>[\s\S]*?<li\s+class="[^"]*\bjob-location"[^>]*>\s*([^<]+)<\/li>/i);
+    if (!match) continue;
+    const path = match[1].replace(/&amp;/g, "&");
+    if (!/^\/job\/[\w-]+\/[\w-]+\/1771\/\d+$/i.test(path)) continue;
+    const location = match[3].trim();
+    const locationMatch = location.match(/^(.+),\s*(PA|NJ)$/i);
+    if (!locationMatch || !isGreaterPhiladelphiaLocation(locationMatch[1], locationMatch[2], "")) continue;
+    if (locationMatch[2].toUpperCase() === "NJ" &&
+        !["camden", "cherry hill", "mount laurel", "moorestown"].includes(normalizeEvidence(locationMatch[1]))) continue;
+    const city = locationMatch[1].trim();
+    const title = match[2].replace(/&amp;/g, "&").replace(/&#(?:39|x27);/gi, "'").trim();
+    if (!title) continue;
+    jobs.push({ title, url: new URL(path, SANTANDER_SEARCH).href, city,
+      location: `${city}, ${locationMatch[2].toUpperCase()}`, roleType: "Not specified", postedDate: "", description: "" });
+  }
+  return jobs;
+}
+
+async function fetchSantanderJobs(): Promise<ScannedJob[]> {
+  try {
+    const jobs = new Map<string, ScannedJob>();
+    let total: number | null = null;
+    let seenListings = 0;
+    for (let page = 1; page <= 20; page += 1) {
+      const url = new URL(SANTANDER_SEARCH);
+      if (page > 1) url.searchParams.set("p", String(page));
+      const response = await fetch(url, { headers: { Accept: "text/html" },
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+      if (!response.ok) return [];
+      const html = await response.text();
+      const count = Number(html.match(/id="search-results-jobs"[^>]*data-results-count="(\d+)"/i)?.[1]);
+      const pagination = html.match(/currently on page (\d+) \/ (\d+)/i);
+      const pageCount = Number(pagination?.[2]);
+      const pageListings = (html.match(/class="search-results-list__job-link"/g) || []).length;
+      if (!Number.isSafeInteger(count) || !count || !Number.isSafeInteger(pageCount) || pageCount > 20 ||
+          Number(pagination?.[1]) !== page || pageCount < page || !pageListings ||
+          (total !== null && count !== total)) return [];
+      total = count;
+      seenListings += pageListings;
+      for (const job of parseSantanderJobs(html)) jobs.set(job.url, job);
+      if (page === pageCount) return seenListings === count ? [...jobs.values()] : [];
+    }
+    return [];
+  } catch (error) {
+    console.warn("[Job scanner] Santander official search unavailable:", error);
+    return [];
+  }
+}
+
+/** Use location evidence from the current Workday search results (or their detail pages). */
+export function parseWorkdayJobs(postings: unknown, boardUrl: string): ScannedJob[] {
+  if (!Array.isArray(postings)) return [];
+  const jobs = new Map<string, ScannedJob>();
+  for (const posting of postings) {
+    const path = String(posting?.externalPath || "");
+    const title = String(posting?.title || "").trim();
+    if (!title || !/^\/job\/[\w%.-]+\/[\w%.-]+$/i.test(path)) continue;
+    const locations = Array.isArray(posting?.locations) ? posting.locations : [posting?.locationsText];
+    const local = locations.map((location: unknown) => String(location || "").match(/^(.+?),\s*(PA|NJ)$/i))
+      .find((parts) => parts && isGreaterPhiladelphiaLocation(parts[1], parts[2], "") &&
+        (parts[2].toUpperCase() !== "NJ" || ["camden", "cherry hill", "mount laurel", "moorestown", "haddonfield"].includes(normalizeEvidence(parts[1]))));
+    if (!local) continue;
+    const city = local[1].trim();
+    const url = new URL(`/en-US/${new URL(boardUrl).pathname.split("/").filter(Boolean).pop()}${path}`,
+      boardUrl).href;
+    jobs.set(url, { title, url, location: `${city}, ${local[2].toUpperCase()}`, city,
+      roleType: "Not specified", postedDate: "", description: "" });
+  }
+  return [...jobs.values()];
+}
+
+async function fetchWorkdayJobs(boardUrl: string): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    const tenant = board.hostname.match(/^([a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com$/i)?.[1];
+    const site = board.pathname.match(/^\/(?:en-US\/)?([a-z0-9_-]+)\/?$/i)?.[1];
+    if (!tenant || !site) return [];
+    const endpoint = new URL(`/wday/cxs/${tenant}/${site}`, board.origin);
+    const postings: any[] = [];
+    for (const searchText of ["Pennsylvania", "New Jersey"]) {
+      let total: number | null = null;
+      for (let offset = 0; offset === 0 || offset < total!; offset += 20) {
+        if (offset >= 200) return [];
+        const response = await fetch(`${endpoint.href}/jobs`, { method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ appliedFacets: {}, limit: 20, offset, searchText }),
+          signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+        if (!response.ok) return [];
+        const data = await response.json();
+        if (!Number.isSafeInteger(data?.total) || !Array.isArray(data?.jobPostings) ||
+            (total !== null && data.total !== 0 && total !== data.total) ||
+            data.jobPostings.length < Math.min(20, (total ?? data.total) - offset)) return [];
+        total ??= data.total;
+        postings.push(...data.jobPostings);
+      }
+    }
+    // Workday abbreviates multi-site postings as "N Locations"; read those details
+    // instead of silently dropping an opening that may be based in Philadelphia.
+    for (let index = 0; index < postings.length; index += 1) {
+      const posting = postings[index];
+      if (!/^\d+ Locations$/i.test(String(posting?.locationsText || ""))) continue;
+      const path = String(posting?.externalPath || "");
+      if (!/^\/job\/[\w%.-]+\/[\w%.-]+$/i.test(path)) return [];
+      const response = await fetch(`${endpoint.href}${path}`, { headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+      if (!response.ok) return [];
+      const detail = (await response.json())?.jobPostingInfo;
+      if (!detail || !Array.isArray(detail.additionalLocations)) return [];
+      posting.locations = [detail.location, ...detail.additionalLocations];
+    }
+    return parseWorkdayJobs(postings, board.href);
+  } catch (error) {
+    console.warn(`[Job scanner] Workday board unavailable for ${boardUrl}:`, error);
+    return [];
+  }
+}
+
+/** SmartRecruiters publishes an unauthenticated, first-party feed for each public company board. */
+export function parseSmartRecruitersJobs(payload: unknown, company: string): ScannedJob[] {
+  const postings = (payload as { content?: unknown })?.content;
+  if (!Array.isArray(postings)) return [];
+  const jobs = new Map<string, ScannedJob>();
+  for (const posting of postings) {
+    const id = String(posting?.id || "");
+    const title = String(posting?.name || "").trim();
+    const city = String(posting?.location?.city || "").trim();
+    const region = String(posting?.location?.region || "").trim();
+    const state = region.toLowerCase() === "pennsylvania" ? "PA" :
+      region.toLowerCase() === "new jersey" ? "NJ" : region;
+    if (!/^\d+$/.test(id) || !title ||
+        String(posting?.company?.identifier || "") !== company ||
+        String(posting?.visibility || "") !== "PUBLIC" ||
+        !isGreaterPhiladelphiaLocation(city, state, String(posting?.location?.postalCode || ""))) continue;
+    const url = `https://jobs.smartrecruiters.com/${encodeURIComponent(company)}/${id}`;
+    jobs.set(url, { title, url, location: `${city}, ${state}`, city,
+      roleType: String(posting?.typeOfEmployment?.label || "Not specified"),
+      postedDate: String(posting?.releasedDate || ""), description: "" });
+  }
+  return [...jobs.values()];
+}
+
+async function fetchSmartRecruitersJobs(boardUrl: string): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    if (board.hostname !== "careers.smartrecruiters.com") return [];
+    const company = board.pathname.match(/^\/([a-z0-9_-]+)\/?$/i)?.[1];
+    if (!company) return [];
+    const jobs = new Map<string, ScannedJob>();
+    let total: number | null = null;
+    for (let offset = 0; offset === 0 || offset < total!; offset += 100) {
+      if (offset >= 1000) return [];
+      const response = await fetch(`https://api.smartrecruiters.com/v1/companies/${company}/postings?limit=100&offset=${offset}`,
+        { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+      if (!response.ok) return [];
+      const payload = await response.json();
+      if (!Number.isSafeInteger(payload?.totalFound) || !Array.isArray(payload?.content) ||
+          (total !== null && payload.totalFound !== total) ||
+          payload.content.length < Math.min(100, (total ?? payload.totalFound) - offset)) return [];
+      total ??= payload.totalFound;
+      for (const job of parseSmartRecruitersJobs(payload, company)) jobs.set(job.url, job);
+    }
+    return [...jobs.values()];
+  } catch (error) {
+    console.warn(`[Job scanner] SmartRecruiters board unavailable for ${boardUrl}:`, error);
+    return [];
+  }
+}
+
+/** SEPTA's official SuccessFactors career site server-renders every search tile. */
+export function parseSeptaJobs(html: string): ScannedJob[] {
+  const pageSize = Number(html.match(/jobRecordsPerPage: parseInt\("(\d+)"\)/)?.[1]);
+  const total = Number(html.match(/jobRecordsFound: parseInt\("(\d+)"\)/)?.[1]);
+  if (!Number.isSafeInteger(total) || !total || !Number.isSafeInteger(pageSize) || total > pageSize) return [];
+  const tiles = [...html.matchAll(/<li class="job-tile\b[^>]*data-url="([^"]+)"[^>]*>([\s\S]*?)<\/li>/gi)];
+  if (tiles.length !== total) return [];
+  const jobs = new Map<string, ScannedJob>();
+  for (const [, rawPath, tile] of tiles) {
+    const path = rawPath.replace(/&amp;/g, "&");
+    const title = tile.match(/class="jobTitle-link[^"]*"[^>]*href="[^"]+"[^>]*>([^<]+)/i)?.[1]
+      ?.replace(/&amp;/g, "&").trim();
+    const city = tile.match(/id="job-\d+-desktop-section-city-value"[^>]*>\s*([^<]+)/i)?.[1]?.trim();
+    if (!title || !city || !/^\/job\/[\w%.&()-]+\/\d+\/$/i.test(path)) return [];
+    if (!isGreaterPhiladelphiaLocation(city, "PA", "")) continue;
+    const url = new URL(path, SEPTA_ALL_JOBS).href;
+    jobs.set(url, { title, url, city, location: `${city}, PA`, roleType: "Not specified",
+      postedDate: "", description: "" });
+  }
+  return [...jobs.values()];
+}
+
+async function fetchSeptaJobs(): Promise<ScannedJob[]> {
+  try {
+    const response = await fetch(SEPTA_ALL_JOBS, { headers: { Accept: "text/html" },
+      signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+    return response.ok ? parseSeptaJobs(await response.text()) : [];
+  } catch (error) {
+    console.warn("[Job scanner] SEPTA's official jobs page unavailable:", error);
+    return [];
+  }
+}
+
+/** Only CCD's own, currently displayed accordion listings, not partner-company jobs. */
+export function parseCenterCityJobs(html: string): ScannedJob[] {
+  const section = html.match(/<h2>\s*CCD open positions\s*<\/h2>([\s\S]*?)(?=<h2>\s*CCD partner open positions\s*<\/h2>)/i)?.[1];
+  if (!section) return [];
+  const cards = section.split(/<div class="accordion_item"[^>]*>/i).slice(1);
+  if (!cards.length) return [];
+  const jobs: ScannedJob[] = [];
+  for (const card of cards) {
+    const title = card.match(/<div class="accordion_header"[^>]*>\s*([^<]+)</i)?.[1]
+      ?.replace(/&amp;/g, "&").trim();
+    if (!title) return [];
+    if (/^don.t see the job you are looking for\?/i.test(title)) continue;
+    const url = card.match(/<a\b[^>]*href="(https:\/\/www\.paycomonline\.net\/v4\/ats\/web\.php\/portal\/[A-F\d]{32}\/(?:jobs\/\d+|career-page))"[^>]*>\s*Learn More\s*<\/a>/i)?.[1];
+    if (!url) return [];
+    jobs.push({ title, url, city: "Philadelphia", location: "Philadelphia, PA",
+      roleType: "Not specified", postedDate: "", description: "" });
+  }
+  return jobs;
+}
+
+/** Newman lists its current openings and their official detail links on its careers page. */
+export function parseNewmanJobs(html: string): ScannedJob[] {
+  const cards = [...html.matchAll(/<div class="careers-posting_container">([\s\S]*?)<p class="careers-posting_container_row_brief">/gi)];
+  const jobs: ScannedJob[] = [];
+  for (const [, card] of cards) {
+    const title = card.match(/<h3>\s*([^<]+)\s*<\/h3>/i)?.[1]?.trim();
+    const url = card.match(/href="(https:\/\/newmanpaperboard\.com\/job\/[a-z0-9-]+\/)"/i)?.[1];
+    if (title && url) jobs.push({ title, url, city: "Philadelphia", location: "Philadelphia, PA",
+      roleType: "Not specified", postedDate: "", description: "" });
+  }
+  return jobs;
+}
+
+async function fetchNewmanJobs(document: SourceDocument): Promise<ScannedJob[]> {
+  const listings = parseNewmanJobs(document.text);
+  if (!listings.length) return [];
+  const jobs: ScannedJob[] = [];
+  for (const job of listings) {
+    const detail = await fetchOfficialHtml(job.url);
+    // The detail page must still exist and explicitly place the opening locally.
+    if (!detail) return [];
+    if (/Philadelphia, PA|Philadelphia-based|city of Philadelphia/i.test(detail.text) &&
+        !/position (?:has been )?filled|this job (?:is )?closed/i.test(detail.text)) jobs.push(job);
+  }
+  return jobs;
 }
 
 function getAdpCustomField(
@@ -284,12 +618,14 @@ export function parseUkgJobs(payload: unknown, boardUrl: string): ScannedJob[] {
 async function fetchUkgJobs(boardUrl: string): Promise<ScannedJob[]> {
   try {
     const board = new URL(boardUrl);
-    if (!board.hostname.toLowerCase().endsWith(".rec.pro.ukg.net")) return [];
+    if (!board.hostname.toLowerCase().endsWith(".rec.pro.ukg.net") &&
+        board.hostname.toLowerCase() !== "recruiting.ultipro.com") return [];
     const boardPath = board.pathname.match(/^\/(?:[^/]+)\/JobBoard\/[a-f\d-]{36}\//i);
     if (!boardPath) return [];
     const endpoint = new URL(`${boardPath[0]}JobBoardView/LoadSearchResults`, board.origin);
     const jobs = new Map<string, ScannedJob>();
     const pageSize = 200;
+    let expectedTotal: number | null = null;
     for (let page = 0; page < 5; page += 1) {
       const response = await fetch(endpoint, {
         method: "POST",
@@ -297,15 +633,23 @@ async function fetchUkgJobs(boardUrl: string): Promise<ScannedJob[]> {
         body: JSON.stringify({ opportunitySearch: { QueryString: "", Filters: [], Top: pageSize, Skip: page * pageSize } }),
         signal: AbortSignal.timeout(READER_TIMEOUT_MS),
       });
-      if (!response.ok) break;
+      if (!response.ok) return [];
       const payload = await response.json();
+      if (!Array.isArray(payload?.opportunities)) return [];
+      if (Number.isSafeInteger(payload.totalCount)) {
+        if (expectedTotal !== null && expectedTotal !== payload.totalCount) return [];
+        expectedTotal = payload.totalCount;
+      }
       for (const job of parseUkgJobs(payload, new URL(boardPath[0], board.origin).href)) {
         jobs.set(job.url, job);
       }
-      const received = Array.isArray(payload?.opportunities) ? payload.opportunities.length : 0;
-      if (!received || received < pageSize || (page + 1) * pageSize >= Number(payload?.totalCount || 0)) break;
+      const received = payload.opportunities.length;
+      if (expectedTotal !== null && (page * pageSize + received < Math.min(expectedTotal, (page + 1) * pageSize))) return [];
+      if (!received || received < pageSize || (expectedTotal !== null && (page + 1) * pageSize >= expectedTotal)) {
+        return [...jobs.values()];
+      }
     }
-    return [...jobs.values()];
+    return [];
   } catch (error) {
     console.warn(`[Job scanner] Could not read UKG board ${boardUrl}:`, error);
     return [];
@@ -390,18 +734,25 @@ async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<Sc
   const adpBoards = new Set<string>();
   const ukgBoards = new Set<string>();
   const taleoBoards = new Set<string>();
+  const workdayBoards = new Set<string>();
+  const smartRecruitersBoards = new Set<string>();
   for (const document of documents) {
     try {
       for (const url of [document.url, ...extractLikelyCareerLinks(document)]) {
         const board = new URL(url);
         const hostname = board.hostname.toLowerCase();
         if (hostname === "adp.com" || hostname.endsWith(".adp.com")) adpBoards.add(board.href);
-        if (hostname.endsWith(".rec.pro.ukg.net")) {
+        if (hostname.endsWith(".rec.pro.ukg.net") || hostname === "recruiting.ultipro.com") {
           const boardPath = board.pathname.match(/^\/(?:[^/]+)\/JobBoard\/[a-f\d-]{36}\//i);
           if (boardPath) ukgBoards.add(new URL(boardPath[0], board.origin).href);
         }
         if (/(?:^|\.)taleo\.net$/i.test(board.hostname) &&
             /^\/careersection\/[^/]+\/jobsearch\.ftl$/i.test(board.pathname)) taleoBoards.add(board.href);
+        if (/^[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com$/i.test(hostname) &&
+            /^\/(?:en-US\/)?[a-z0-9_-]+\/?$/i.test(board.pathname)) workdayBoards.add(board.href);
+        if (hostname === "careers.smartrecruiters.com" && /^\/[a-z0-9_-]+\/?$/i.test(board.pathname)) {
+          smartRecruitersBoards.add(board.href);
+        }
       }
     } catch {
       // Ignore malformed source URLs; normal evidence extraction remains available.
@@ -413,6 +764,14 @@ async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<Sc
   }
   for (const boardUrl of [...ukgBoards].slice(0, 4)) {
     const jobs = await fetchUkgJobs(boardUrl);
+    if (jobs.length > 0) return jobs;
+  }
+  for (const boardUrl of [...workdayBoards].slice(0, 4)) {
+    const jobs = await fetchWorkdayJobs(boardUrl);
+    if (jobs.length > 0) return jobs;
+  }
+  for (const boardUrl of [...smartRecruitersBoards].slice(0, 4)) {
+    const jobs = await fetchSmartRecruitersJobs(boardUrl);
     if (jobs.length > 0) return jobs;
   }
   const jobs = new Map<string, ScannedJob>();
@@ -780,8 +1139,39 @@ export async function scanJobsForEmployer(
   let lastWarning = "No evidence-backed open positions were found.";
   let lastError: unknown = null;
   const officialUrl = LEGACY_CAREER_URLS.get(comparableUrl(targetUrl)) || targetUrl;
+  if (employerName.trim().toLowerCase() === "bank of america" &&
+      new URL(officialUrl).hostname.toLowerCase() === "careers.bankofamerica.com") {
+    const bankJobs = await fetchBankOfAmericaJobs();
+    if (bankJobs.length > 0) return { jobs: bankJobs, source: "official-page", authoritative: true };
+  }
+  if (employerName.trim().toLowerCase() === "santander" &&
+      ["jobs.santanderbank.com", "www.santandercareers.com"].includes(new URL(officialUrl).hostname.toLowerCase())) {
+    const santanderJobs = await fetchSantanderJobs();
+    if (santanderJobs.length > 0) return { jobs: santanderJobs, source: "official-page", authoritative: true };
+  }
+  if (employerName.trim().toLowerCase() === "septa" && new URL(officialUrl).hostname === "jobs.septa.org") {
+    const septaJobs = await fetchSeptaJobs();
+    if (septaJobs.length > 0) return { jobs: septaJobs, source: "official-page", authoritative: true };
+  }
+  if (employerName.trim().toLowerCase() === "phmc" &&
+      ["phmc.org", "www.phmc.org"].includes(new URL(officialUrl).hostname.toLowerCase())) {
+    const phmcJobs = await fetchUkgJobs(PHMC_BOARD);
+    if (phmcJobs.length > 0) return { jobs: phmcJobs, source: "official-page", authoritative: true };
+  }
   const directDocument = await fetchOfficialHtml(officialUrl);
   if (directDocument) {
+    if (employerName.trim().toLowerCase() === "center city district" &&
+        new URL(directDocument.url).hostname === "centercityphila.org") {
+      const centerCityJobs = parseCenterCityJobs(directDocument.text);
+      if (centerCityJobs.length > 0) {
+        return { jobs: centerCityJobs, source: "official-page", authoritative: true };
+      }
+    }
+    if (employerName.trim().toLowerCase() === "newman paperboard" &&
+        new URL(directDocument.url).hostname === "newmanpaperboard.com") {
+      const newmanJobs = await fetchNewmanJobs(directDocument);
+      if (newmanJobs.length > 0) return { jobs: newmanJobs, source: "official-page", authoritative: true };
+    }
     const directJobs = await extractStructuredAtsJobs([directDocument]);
     if (directJobs.length > 0) {
       return { jobs: directJobs, source: "official-page", authoritative: true };
