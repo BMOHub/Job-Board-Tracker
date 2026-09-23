@@ -6,6 +6,7 @@ import {
   extractLikelyCareerLinks,
   parseAdpJobs,
   parseEvidenceBackedJobs,
+  parseUkgJobs,
   type SourceDocument,
 } from "./gemini-jobs.js";
 
@@ -176,4 +177,46 @@ test("extracts only Greater Philadelphia jobs from an official ADP response", ()
   assert.equal(jobs[0].title, "Mechanical Engineer");
   assert.equal(jobs[0].location, "Wayne, PA");
   assert.match(jobs[0].url, /jobId=regional-job_1/);
+});
+
+test("discovers Rivers Casino's official UKG board from its careers page", () => {
+  const links = extractLikelyCareerLinks({
+    url: "https://www.riverscasino.com/philadelphia/careers",
+    text: '<a href="https://rushst.rec.pro.ukg.net/RIV1014RIVCA/JobBoard/27a20bf0-126e-44c7-a462-00944f601b0c/?q=&amp;f4=location">Open Positions</a>',
+  });
+  assert.deepEqual(links, [
+    "https://rushst.rec.pro.ukg.net/RIV1014RIVCA/JobBoard/27a20bf0-126e-44c7-a462-00944f601b0c/?q=&f4=location",
+  ]);
+});
+
+test("maps official UKG opportunities without including other casino cities or fake positions", () => {
+  const board = "https://rushst.rec.pro.ukg.net/RIV1014RIVCA/JobBoard/27a20bf0-126e-44c7-a462-00944f601b0c/?f4=location";
+  const jobs = parseUkgJobs({ opportunities: [
+    {
+      Id: "8d27e1ef-97d9-416a-9139-075f06aac400", Title: "PT Cashier Flipt",
+      FullTime: false, PostedDate: "2026-09-22T18:41:02.312Z", BriefDescription: "Guest service",
+      Locations: [{ Address: { City: "Philadelphia", State: { Code: "PA" }, PostalCode: "19125" } }],
+    },
+    {
+      Id: "8d27e1ef-97d9-416a-9139-075f06aac400", Title: "PT Cashier Flipt",
+      Locations: [{ Address: { City: "Philadelphia", State: { Code: "PA" } } }],
+    },
+    {
+      Id: "14318a95-c193-4cf1-ae06-f40444fe2d03", Title: "Poker Dealer",
+      Locations: [{ Address: { City: "Portsmouth", State: { Code: "VA" } } }],
+    },
+    {
+      Id: "fcfba8f9-6bed-44a9-81e3-cb5a1148987d", Title: "Fake Philadelphia, TX",
+      Locations: [{ Address: { City: "Philadelphia", State: { Code: "TX" } } }],
+    },
+    { Id: "not-a-real-id", Title: "Invented", Locations: [] },
+  ] }, board);
+
+  assert.equal(jobs.length, 1);
+  assert.deepEqual(jobs[0], {
+    title: "PT Cashier Flipt",
+    url: "https://rushst.rec.pro.ukg.net/RIV1014RIVCA/JobBoard/27a20bf0-126e-44c7-a462-00944f601b0c/OpportunityDetail?opportunityId=8d27e1ef-97d9-416a-9139-075f06aac400",
+    location: "Philadelphia, PA", city: "Philadelphia", roleType: "Part-time",
+    postedDate: "2026-09-22T18:41:02.312Z", description: "Guest service",
+  });
 });

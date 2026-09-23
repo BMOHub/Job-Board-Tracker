@@ -123,6 +123,7 @@ function normalizeEvidence(value: string): string {
 function isGreaterPhiladelphiaLocation(city: string, state: string, postalCode: string): boolean {
   const normalizedCity = normalizeEvidence(city);
   const normalizedState = state.trim().toUpperCase();
+  if (normalizedState !== "PA" && normalizedState !== "NJ") return false;
   const localCities = [
     "philadelphia", "wayne", "radnor", "king of prussia", "conshohocken", "malvern",
     "west chester", "chester", "media", "bala cynwyd", "bryn mawr", "fort washington",
@@ -224,12 +225,93 @@ async function fetchAdpJobs(boardUrl: string): Promise<ScannedJob[]> {
   }
 }
 
+/** Maps currently listed UKG Pro opportunities to their official detail pages. */
+export function parseUkgJobs(payload: unknown, boardUrl: string): ScannedJob[] {
+  const opportunities = (payload as any)?.opportunities;
+  if (!Array.isArray(opportunities)) return [];
+
+  const board = new URL(boardUrl);
+  board.search = "";
+  board.hash = "";
+  const jobs: ScannedJob[] = [];
+  const seen = new Set<string>();
+  for (const opportunity of opportunities) {
+    const id = String(opportunity?.Id || "");
+    const title = String(opportunity?.Title || "").trim();
+    if (!/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(id) || !title || seen.has(id)) continue;
+
+    const location = (Array.isArray(opportunity.Locations) ? opportunity.Locations : []).find((candidate: any) => {
+      const address = candidate?.Address || {};
+      return isGreaterPhiladelphiaLocation(
+        String(address.City || ""),
+        String(address.State?.Code || ""),
+        String(address.PostalCode || ""),
+      );
+    });
+    if (!location) continue;
+
+    const address = location.Address;
+    const city = String(address.City || "").trim();
+    const state = String(address.State.Code || "").trim();
+    const detailUrl = new URL("OpportunityDetail", board);
+    detailUrl.searchParams.set("opportunityId", id);
+    jobs.push({
+      title,
+      url: detailUrl.href,
+      location: `${city}, ${state}`,
+      city,
+      roleType: typeof opportunity.FullTime === "boolean"
+        ? opportunity.FullTime ? "Full-time" : "Part-time"
+        : "Not specified",
+      postedDate: String(opportunity.PostedDate || ""),
+      description: String(opportunity.BriefDescription || ""),
+    });
+    seen.add(id);
+  }
+  return jobs;
+}
+
+async function fetchUkgJobs(boardUrl: string): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    if (!board.hostname.toLowerCase().endsWith(".rec.pro.ukg.net")) return [];
+    const boardPath = board.pathname.match(/^\/(?:[^/]+)\/JobBoard\/[a-f\d-]{36}\//i);
+    if (!boardPath) return [];
+    const endpoint = new URL(`${boardPath[0]}JobBoardView/LoadSearchResults`, board.origin);
+    const jobs = new Map<string, ScannedJob>();
+    const pageSize = 200;
+    for (let page = 0; page < 5; page += 1) {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ opportunitySearch: { QueryString: "", Filters: [], Top: pageSize, Skip: page * pageSize } }),
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+      });
+      if (!response.ok) break;
+      const payload = await response.json();
+      for (const job of parseUkgJobs(payload, new URL(boardPath[0], board.origin).href)) {
+        jobs.set(job.url, job);
+      }
+      const received = Array.isArray(payload?.opportunities) ? payload.opportunities.length : 0;
+      if (!received || received < pageSize || (page + 1) * pageSize >= Number(payload?.totalCount || 0)) break;
+    }
+    return [...jobs.values()];
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read UKG board ${boardUrl}:`, error);
+    return [];
+  }
+}
+
 async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<ScannedJob[]> {
   for (const document of documents) {
     try {
       const hostname = new URL(document.url).hostname.toLowerCase();
       if (hostname === "adp.com" || hostname.endsWith(".adp.com")) {
         const jobs = await fetchAdpJobs(document.url);
+        if (jobs.length > 0) return jobs;
+      }
+      if (hostname.endsWith(".rec.pro.ukg.net")) {
+        const jobs = await fetchUkgJobs(document.url);
         if (jobs.length > 0) return jobs;
       }
     } catch {
