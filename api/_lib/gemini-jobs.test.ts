@@ -5,9 +5,16 @@ import {
   describeGeminiError,
   extractLikelyCareerLinks,
   parseAdpJobs,
+  parseBankOfAmericaJobs,
+  parseCenterCityJobs,
   parseEvidenceBackedJobs,
+  parseNewmanJobs,
+  parseSantanderJobs,
+  parseSeptaJobs,
+  parseSmartRecruitersJobs,
   parseTaleoJobs,
   parseUkgJobs,
+  parseWorkdayJobs,
   requestGeminiWithRetry,
   scanJobsForEmployer,
   type SourceDocument,
@@ -161,6 +168,259 @@ test("discovers ATS links in raw HTML returned by the reader fallback", () => {
   ]);
 });
 
+test("maps only currently listed regional Bank of America jobs to official detail pages", () => {
+  const jobs = parseBankOfAmericaJobs({ jobsList: [
+    { postingTitle: "Relationship Banker", jcrURL: "/en-us/job-detail/26032057/relationship-banker-philadelphia",
+      city: "Philadelphia", state: "Pennsylvania", country: "United States", postedDate: "09/23/2026" },
+    { postingTitle: "Sales Associate", jcrURL: "/en-us/job-detail/26033675/sales-associate-multiple-locations",
+      city: "Boston", state: "Massachusetts", country: "United States",
+      additionalLocations: "US - PA - Philadelphia - 1600 JFK BLVD (PA7188),US - MA - Boston - MAIN ST (MA1000)," },
+    { postingTitle: "Not regional", jcrURL: "/en-us/job-detail/26029486/advisor-wexford",
+      city: "Wexford", state: "Pennsylvania", country: "United States" },
+    { postingTitle: "Wayne, NJ is not Wayne, PA", jcrURL: "/en-us/job-detail/26011172/advisor-wayne",
+      city: "Wayne", state: "New Jersey", country: "United States" },
+    { postingTitle: "Forged job link", jcrURL: "https://other.example/en-us/job-detail/26011173/forged",
+      city: "Philadelphia", state: "Pennsylvania", country: "United States" },
+  ] });
+  assert.deepEqual(jobs.map((job) => job.title), ["Relationship Banker", "Sales Associate"]);
+  assert.equal(jobs[0].url, "https://careers.bankofamerica.com/en-us/job-detail/26032057/relationship-banker-philadelphia");
+  assert.equal(jobs[1].location, "Philadelphia, PA");
+  assert.deepEqual(parseBankOfAmericaJobs({ jobsList: [] }), []);
+});
+
+test("Bank of America paginates official regional listings without invoking Gemini", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    requests.push(url.href);
+    if (url.pathname === "/services/jobssearchservlet") {
+      const isPa = url.searchParams.get("state") === "Pennsylvania";
+      const start = Number(url.searchParams.get("start"));
+      assert.equal(Number(url.searchParams.get("rows")), start + 100);
+      const jobsList = (isPa && start === 0 ? Array.from({ length: 100 }, (_, index) => ({
+        postingTitle: `Regional banker ${index}`, jcrURL: `/en-us/job-detail/${26030000 + index}/banker`,
+        city: "Philadelphia", state: "Pennsylvania", country: "United States",
+      })) : isPa ? [{ postingTitle: "Regional banker 101", jcrURL: "/en-us/job-detail/26030200/banker",
+        city: "Philadelphia", state: "Pennsylvania", country: "United States" }] : []);
+      return Response.json({ totalMatches: isPa ? 101 : 0, jobsList });
+    }
+    throw new Error(`Unexpected reader or Gemini request: ${url}`);
+  };
+  try {
+    const result = await scanJobsForEmployer("Bank of America", "https://careers.bankofamerica.com/");
+    assert.equal(result.jobs.length, 101);
+    assert.equal(result.source, "official-page");
+    assert.equal(result.authoritative, true);
+    assert.equal(requests.length, 3);
+    assert.ok(requests.every((url) => url.startsWith("https://careers.bankofamerica.com/services/jobssearchservlet?")));
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
+});
+
+const santanderPage = (page: number, count = 2) => `<ul id="search-results-jobs" class="search-results-list__list" data-results-count="${count}">
+  <li class="search-results-list__item"><a class="search-results-list__job-link" href="/job/${page === 1 ? "philadelphia/banker-philadelphia/1771/99865173520" : "conshohocken/manager-conshohocken/1771/99119374448"}">${page === 1 ? "Relationship Banker" : "Branch Manager"}</a>
+  <li class="search-results-list__job-info job-location">${page === 1 ? "Philadelphia, PA" : "Conshohocken, PA"}</li></li></ul>
+  <nav id="pagination-bottom">You are currently on page ${page} / 2.</nav>`;
+
+test("reads regional Santander jobs on its official search pages", async () => {
+  const first = parseSantanderJobs(santanderPage(1) + '<a class="job-list__job-link" href="/job/dallas/a/1771/1234">Recommended</a>');
+  assert.deepEqual(first.map((job) => job.title), ["Relationship Banker"]);
+  assert.equal(first[0].url, "https://www.santandercareers.com/job/philadelphia/banker-philadelphia/1771/99865173520");
+  assert.deepEqual(parseSantanderJobs(santanderPage(1).replace("Philadelphia, PA", "Pittsburgh, PA")), []);
+  assert.deepEqual(parseSantanderJobs(santanderPage(1).replace("Philadelphia, PA", "Wayne, NJ")), []);
+  assert.deepEqual(parseSantanderJobs(santanderPage(1).replace('class="search-results-list__job-info job-location"',
+    'class="search-results-list__job-info missing-location"')), []);
+
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    requests.push(url.href);
+    if (url.origin !== "https://www.santandercareers.com") throw new Error(`Unexpected request: ${url}`);
+    return new Response(santanderPage(Number(url.searchParams.get("p") || "1")),
+      { headers: { "Content-Type": "text/html" } });
+  };
+  try {
+    const result = await scanJobsForEmployer("Santander", "https://jobs.santanderbank.com/");
+    assert.equal(result.jobs.length, 2);
+    assert.equal(result.authoritative, true);
+    assert.deepEqual(requests.map((url) => new URL(url).searchParams.get("p")), [null, "2"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
+});
+
+test("does not claim a complete Santander scan if the second page is unavailable", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.startsWith("https://www.santandercareers.com/search-jobs/")) {
+      return url.includes("?p=2") ? new Response("Unavailable", { status: 503 }) :
+        new Response(santanderPage(1), { headers: { "Content-Type": "text/html" } });
+    }
+    return new Response("Unavailable", { status: 503 });
+  };
+  try {
+    const result = await scanJobsForEmployer("Santander", "https://jobs.santanderbank.com/");
+    assert.equal(result.jobs.length, 0);
+    assert.equal(result.authoritative, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
+});
+
+test("reads Workday regional results, including a verified secondary location", async () => {
+  const board = "https://mtb.wd5.myworkdayjobs.com/MTB";
+  const jobs = parseWorkdayJobs([
+    { title: "Teller", externalPath: "/job/Philadelphia-PA/Teller_R89011", locationsText: "Philadelphia, PA" },
+    { title: "Engineer", externalPath: "/job/New-York/Engineer_R12345", locationsText: "2 Locations",
+      locations: ["New York, NY", "Cherry Hill, NJ"] },
+    { title: "Other Wayne", externalPath: "/job/Wayne-NJ/Advisor_R12346", locationsText: "Wayne, NJ" },
+    { title: "Unsafe URL", externalPath: "https://evil.example/job/Philadelphia-PA/unsafe", locationsText: "Philadelphia, PA" },
+  ], board);
+  assert.deepEqual(jobs.map((job) => job.title), ["Teller", "Engineer"]);
+  assert.equal(jobs[0].url, "https://mtb.wd5.myworkdayjobs.com/en-US/MTB/job/Philadelphia-PA/Teller_R89011");
+  assert.equal(jobs[1].location, "Cherry Hill, NJ");
+});
+
+test("follows an employer's official Workday board without Gemini", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    requests.push(url);
+    if (url === "https://www.mtb.com/careers") return new Response(
+      '<html><a href="https://mtb.wd5.myworkdayjobs.com/MTB">Search open jobs</a></html>'.padEnd(130),
+      { headers: { "Content-Type": "text/html" } });
+    if (url.endsWith("/wday/cxs/mtb/MTB/jobs")) {
+      const query = JSON.parse(String(init?.body));
+      assert.equal(query.limit, 20);
+      return Response.json({ total: query.searchText === "Pennsylvania" ? 2 : 0, jobPostings:
+        query.searchText === "Pennsylvania" ? [
+          { title: "Teller", externalPath: "/job/Philadelphia-PA/Teller_R89011", locationsText: "Philadelphia, PA" },
+          { title: "Engineer", externalPath: "/job/New-York/Engineer_R12345", locationsText: "2 Locations" },
+        ] : [] });
+    }
+    if (url.endsWith("/wday/cxs/mtb/MTB/job/New-York/Engineer_R12345")) return Response.json({ jobPostingInfo: {
+      location: "New York, NY", additionalLocations: ["Cherry Hill, NJ"],
+    } });
+    throw new Error(`Unexpected Gemini/Reader request ${url}`);
+  };
+  try {
+    const result = await scanJobsForEmployer("M&T Bank", "https://www.mtb.com/careers");
+    assert.equal(result.jobs.length, 2);
+    assert.equal(result.authoritative, true);
+    assert.equal(requests.length, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
+});
+
+test("accepts only public regional SmartRecruiters postings from the linked company", () => {
+  const company = "MissionCriticalGroup";
+  const job = { id: "3743990015521196", name: "Production Technician", visibility: "PUBLIC",
+    company: { identifier: company }, location: { city: "West Chester", region: "Pennsylvania", postalCode: "19380" } };
+  const jobs = parseSmartRecruitersJobs({ content: [job,
+    { ...job, id: "3743990015521197", location: { city: "Wayne", region: "New Jersey" } },
+    { ...job, id: "3743990015521198", company: { identifier: "OtherCompany" } },
+    { ...job, id: "3743990015521199", visibility: "PRIVATE" },
+    { ...job, id: "3743990015521200", location: { city: "North Wales", region: "Pennsylvania" } },
+  ] }, company);
+  assert.deepEqual(jobs.map((item) => item.title), ["Production Technician", "Production Technician"]);
+  assert.deepEqual(jobs.map((item) => item.city), ["West Chester", "North Wales"]);
+  assert.equal(jobs[0].url, "https://jobs.smartrecruiters.com/MissionCriticalGroup/3743990015521196");
+});
+
+test("follows a first-party SmartRecruiters board without Gemini", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    requests.push(url);
+    if (url === "https://dvmpower.com/careers") return new Response(
+      '<a href="https://careers.smartrecruiters.com/MissionCriticalGroup">Explore jobs</a>'.padEnd(130),
+      { headers: { "Content-Type": "text/html" } });
+    if (url === "https://api.smartrecruiters.com/v1/companies/MissionCriticalGroup/postings?limit=100&offset=0") {
+      return Response.json({ totalFound: 1, content: [
+        { id: "3743990015521196", name: "Production Technician", visibility: "PUBLIC",
+          company: { identifier: "MissionCriticalGroup" },
+          location: { city: "West Chester", region: "Pennsylvania", postalCode: "19380" } },
+      ] });
+    }
+    throw new Error(`Unexpected Gemini/Reader request ${url}`);
+  };
+  try {
+    const result = await scanJobsForEmployer("DVM Power", "https://dvmpower.com/careers");
+    assert.equal(result.jobs.length, 1);
+    assert.equal(result.authoritative, true);
+    assert.equal(requests.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
+});
+
+test("requires a complete official SEPTA listing before treating its jobs as verified", () => {
+  const tile = (id: string, city: string, title: string) => `<li class="job-tile row" data-url="/job/${city}-Example-PA-19107/${id}/">
+    <a class="jobTitle-link fontcolor" href="/job/${city}-Example-PA-19107/${id}/">${title}</a>
+    <div id="job-${id}-desktop-section-city-value">${city}</div></li>`;
+  const page = `jobRecordsPerPage: parseInt("100"), jobRecordsFound: parseInt("2")
+    ${tile("710167600", "Philadelphia", "Mechanic")}${tile("710167601", "Philadelphia", "Driver")}`;
+  const jobs = parseSeptaJobs(page);
+  assert.deepEqual(jobs.map((job) => job.title), ["Mechanic", "Driver"]);
+  assert.match(jobs[0].url, /jobs\.septa\.org\/job\/Philadelphia-Example-PA-19107\/710167600\/$/);
+  assert.deepEqual(parseSeptaJobs(page.replace('jobRecordsFound: parseInt("2")', 'jobRecordsFound: parseInt("3")')), []);
+  assert.deepEqual(parseSeptaJobs(page.replace('jobRecordsPerPage: parseInt("100")', 'jobRecordsPerPage: parseInt("1")')), []);
+});
+
+test("reads CCD employer openings but not future-interest or partner-company cards", () => {
+  const board = "https://www.paycomonline.net/v4/ats/web.php/portal/805501EDE7205EE5EE42E1D5E986266C/";
+  const card = (title: string, path: string) => `<div class="accordion_item"><div class="accordion_header">
+    ${title}<div class="accordion_icon"></div></div><div class="accordion_content">
+    <a class="btn" href="${board}${path}">Learn More</a></div></div>`;
+  const page = `<h2>CCD open positions</h2>${card("Community Service Representative", "jobs/23900")}
+    ${card("Event Operations Team Lead", "career-page")}
+    ${card("Don't see the job you are looking for?", "career-page")}
+    <h2>CCD partner open positions</h2>${card("Another employer's opening", "jobs/19078")}`;
+  assert.deepEqual(parseCenterCityJobs(page).map((job) => job.title),
+    ["Community Service Representative", "Event Operations Team Lead"]);
+  assert.deepEqual(parseCenterCityJobs(page.replace(`${board}jobs/23900`, "https://evil.example/job/23900")), []);
+  assert.deepEqual(parseCenterCityJobs(page.replace("CCD partner open positions", "Other opportunities")), []);
+});
+
+test("takes only linked Newman openings from the current careers page", () => {
+  const html = `<div class="careers-posting_container"><h3>Industrial Mechanic Millwright</h3>
+    <a href="https://newmanpaperboard.com/job/industrial-mechanic-millwright/">Apply</a>
+    <p class="careers-posting_container_row_brief">Philadelphia mill.</p></div>
+    <div class="careers-posting_container"><h3>Offsite</h3>
+    <a href="https://other.example/job/offsite/">Apply</a>
+    <p class="careers-posting_container_row_brief">Do not include</p></div>`;
+  const jobs = parseNewmanJobs(html);
+  assert.deepEqual(jobs.map((job) => job.title), ["Industrial Mechanic Millwright"]);
+  assert.equal(jobs[0].location, "Philadelphia, PA");
+});
+
 test("maps only local currently listed Taleo jobs to official detail pages", () => {
   const jobs = parseTaleoJobs({ requisitionList: [
     { contestNo: "26002340", column: ["Driver/Groundskeeper", "26002340", '["United States-Pennsylvania-Philadelphia"]'] },
@@ -244,8 +504,14 @@ test("replaces verified stale career URLs stored on existing employers", async (
   try {
     await scanJobsForEmployer("University of Pennsylvania (UPenn)", "https://careers.upenn.edu/");
     await scanJobsForEmployer("World Affairs Council", "https://wacphila.org/about/careers/");
+    await scanJobsForEmployer("Acelero", "https://www.acelero.net/careers/");
+    await scanJobsForEmployer("Center City District", "https://www.centercityphila.org/about/jobs");
+    await scanJobsForEmployer("Just Born", "https://www.justborn.com/careers");
     assert.ok(requests.some((url) => url === "https://www.hr.upenn.edu/PennHR/careers-at-penn"));
     assert.ok(requests.some((url) => url === "https://wacphila.org/join-our-team/"));
+    assert.ok(requests.some((url) => url === "https://acelerolearning.com/careers/"));
+    assert.ok(requests.some((url) => url === "https://centercityphila.org/who-we-are/careers/"));
+    assert.ok(requests.some((url) => url === "https://www.justborn.com/join-our-team"));
     assert.equal(requests.some((url) => url.includes("careers.upenn.edu/")), false);
   } finally {
     globalThis.fetch = originalFetch;
@@ -335,6 +601,33 @@ test("finds Rivers UKG jobs in official HTML even if the intermediary Reader fai
     assert.equal(result.source, "official-page");
     assert.equal(result.authoritative, true);
     assert.equal(requests.some((url) => url.startsWith("https://r.jina.ai/")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = originalKey;
+  }
+});
+
+test("discovers PHMC's official legacy Ultipro board without using Gemini", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  const board = "https://recruiting.ultipro.com/PUB1002/JobBoard/c8784846-358b-1bec-45e9-f994af5fccee/";
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url === "https://www.phmc.org/site/careers") return new Response(
+      `<html><a href="${board}">View current jobs</a></html>`.padEnd(130),
+      { headers: { "Content-Type": "text/html" } });
+    if (url === `${board}JobBoardView/LoadSearchResults`) return Response.json({ totalCount: 1,
+      opportunities: [{ Id: "0befa1d8-e107-4742-b6d9-be5ff40d565a", Title: "Case Manager", FullTime: true,
+        Locations: [{ Address: { City: "Philadelphia", State: { Code: "PA" }, PostalCode: "19107" } }] }] });
+    throw new Error(`Unexpected Gemini/Reader request ${url}`);
+  };
+  try {
+    const result = await scanJobsForEmployer("PHMC", "https://www.phmc.org/site/careers");
+    assert.equal(result.jobs.length, 1);
+    assert.equal(result.authoritative, true);
+    assert.match(result.jobs[0].url, /recruiting\.ultipro\.com.*OpportunityDetail\?opportunityId=/);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.GEMINI_API_KEY;

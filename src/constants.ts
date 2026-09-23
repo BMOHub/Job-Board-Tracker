@@ -1,7 +1,7 @@
 export const INITIAL_EMPLOYERS = [
   { name: "SPIN", category: "Education & Educational Partners", website: "https://spininc.org/careers/" },
   { name: "Children’s Village", category: "Education & Educational Partners", website: "https://childrensvillagephila.org/careers/" },
-  { name: "Acelero", category: "Education & Educational Partners", website: "https://www.acelero.net/careers/" },
+  { name: "Acelero", category: "Education & Educational Partners", website: "https://acelerolearning.com/careers/" },
   { name: "School District of Philadelphia", category: "Education & Educational Partners", website: "https://jobs.philasd.org/" },
   { name: "Temple University", category: "Education & Educational Partners", website: "https://careers.temple.edu/" },
   { name: "University of Pennsylvania (UPenn)", category: "Education & Educational Partners", website: "https://www.hr.upenn.edu/PennHR/careers-at-penn" },
@@ -23,7 +23,7 @@ export const INITIAL_EMPLOYERS = [
   { name: "Johnson & Johnson", category: "Engineering & Industry Partners", website: "https://jobs.jnj.com/" },
   { name: "City of Philadelphia", category: "Governmental Partners", website: "https://www.phila.gov/jobs/" },
   { name: "Montgomery County", category: "Governmental Partners", website: "https://www.montcopa.org/jobs" },
-  { name: "Center City District", category: "Governmental Partners", website: "https://www.centercityphila.org/about/jobs" },
+  { name: "Center City District", category: "Governmental Partners", website: "https://centercityphila.org/who-we-are/careers/" },
   { name: "SEPTA", category: "Governmental Partners", website: "https://jobs.septa.org/" },
   { name: "PHMC", category: "Nonprofit & Community Organizations", website: "https://www.phmc.org/site/careers" },
   { name: "JEVS", category: "Nonprofit & Community Organizations", website: "https://www.jevshumanservices.org/careers/" },
@@ -39,7 +39,7 @@ export const INITIAL_EMPLOYERS = [
   { name: "La Colombe / Chobani", category: "Manufacturing Partners", website: "https://www.lacolombe.com/pages/careers" },
   { name: "Deval LifeCycle", category: "Manufacturing Partners", website: "https://devallifecycle.com/careers" },
   { name: "Newman Paperboard", category: "Manufacturing Partners", website: "https://newmanpaperboard.com/careers" },
-  { name: "Just Born", category: "Manufacturing Partners", website: "https://www.justborn.com/careers" },
+  { name: "Just Born", category: "Manufacturing Partners", website: "https://www.justborn.com/join-our-team" },
   { name: "ACCU Staffing", category: "Staffing & Temp Agency Partners", website: "https://www.accustaffing.com/" },
   { name: "Express Employment Professionals", category: "Staffing & Temp Agency Partners", website: "https://www.expresspros.com/philadelphiapa/" }
 ];
