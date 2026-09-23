@@ -8,6 +8,18 @@ export interface ScannedJob {
   description?: string;
 }
 
+export interface JobScanResult {
+  jobs: ScannedJob[];
+  source: string;
+  authoritative: boolean;
+  warning?: string;
+}
+
+/** An unavailable source is not proof that an employer has zero openings. */
+export function isVerifiedScanResult(result: JobScanResult): boolean {
+  return result.jobs.length > 0 || result.authoritative;
+}
+
 /**
  * Checks if the backend Gemini API is configured via Vercel status route.
  */
@@ -30,10 +42,9 @@ export async function scanJobsForEmployer(
   employerName: string,
   websiteUrl: string,
   existingTitles: string[] = []
-): Promise<ScannedJob[]> {
+): Promise<JobScanResult> {
   if (!websiteUrl || !websiteUrl.startsWith("http")) {
-    console.warn(`[JobScanner] Invalid website URL for ${employerName}: ${websiteUrl}`);
-    return [];
+    throw new Error(`Invalid website URL for ${employerName}.`);
   }
 
   try {
@@ -49,16 +60,20 @@ export async function scanJobsForEmployer(
       })
     });
 
+    const data = await response.json();
     if (!response.ok) {
-      console.warn(`[JobScanner] Backend scan failed for ${employerName} (${response.status})`);
-      return [];
+      throw new Error(data?.error || `Backend scan failed (${response.status}).`);
     }
 
-    const data = await response.json();
-    return Array.isArray(data.jobs) ? data.jobs : (Array.isArray(data) ? data : []);
+    return {
+      jobs: Array.isArray(data.jobs) ? data.jobs : [],
+      source: String(data.source || "unknown"),
+      authoritative: Boolean(data.authoritative),
+      warning: data.warning ? String(data.warning) : undefined,
+    };
 
   } catch (error) {
     console.error(`[JobScanner] Failed scanning ${employerName}:`, error);
-    return [];
+    throw error;
   }
 }

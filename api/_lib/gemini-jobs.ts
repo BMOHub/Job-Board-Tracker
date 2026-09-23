@@ -1,4 +1,5 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
+import { INITIAL_EMPLOYERS } from "../../src/constants.js";
 
 export interface ScannedJob {
   title: string;
@@ -10,181 +11,858 @@ export interface ScannedJob {
   description: string;
 }
 
-function getAIClient() {
+export interface ScanJobsResult {
+  jobs: ScannedJob[];
+  source: "official-page" | "grounded-pages" | "no-jobs-found";
+  authoritative: boolean;
+  warning?: string;
+  error?: string;
+}
+
+export interface SourceDocument {
+  url: string;
+  text: string;
+}
+
+export const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite";
+const MODEL = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+const SEARCH_GROUNDING_ENABLED = process.env.GEMINI_ENABLE_SEARCH_GROUNDING === "true";
+const MAX_DOCUMENT_CHARS = 80_000;
+const MAX_SOURCE_DOCUMENTS = 5;
+const READER_TIMEOUT_MS = 12_000;
+const DIRECT_TIMEOUT_MS = 7_000;
+const OFFICIAL_HOSTS = new Set(INITIAL_EMPLOYERS.map((employer) => new URL(employer.website).hostname.toLowerCase()));
+const LEGACY_CAREER_URLS = new Map([
+  ["https://careers.upenn.edu/", "https://www.hr.upenn.edu/PennHR/careers-at-penn"],
+  ["https://wacphila.org/about/careers", "https://wacphila.org/join-our-team/"],
+]);
+const ATS_HOST_PATTERN = /(?:^|\.)(?:myworkdayjobs\.com|greenhouse\.io|lever\.co|taleo\.net|oraclecloud\.com|icims\.com|smartrecruiters\.com|ultipro\.com|ukg\.com|bamboohr\.com|adp\.com|jobvite\.com|paylocity\.com|dayforcehcm\.com|successfactors\.com|sapsf\.com)$/i;
+
+export function hasGeminiApiKey(): boolean {
   const key = process.env.GEMINI_API_KEY || "";
-  if (!key || key === "MY_GEMINI_API_KEY") return null;
+  return Boolean(key && key !== "MY_GEMINI_API_KEY");
+}
+
+function getAIClient(): GoogleGenAI | null {
+  const key = process.env.GEMINI_API_KEY || "";
+  if (!hasGeminiApiKey()) return null;
+
   try {
     return new GoogleGenAI({ apiKey: key });
-  } catch (e) {
-    console.error("Failed to initialize GoogleGenAI:", e);
+  } catch (error) {
+    console.error("Failed to initialize GoogleGenAI:", error);
     return null;
   }
 }
 
-function cleanAndParseJSON(text: string, baseUrl: string): ScannedJob[] {
-  if (!text) return [];
+/** Converts upstream SDK failures into actionable messages without exposing secrets. */
+export function describeGeminiError(error: unknown): string {
+  const candidate = error as { message?: unknown; status?: unknown; code?: unknown } | null;
+  const rawMessage = String(candidate?.message || "");
+  const normalized = rawMessage.toLowerCase();
+  const status = Number(candidate?.status || candidate?.code || 0) || undefined;
 
-  let cleanText = text.replace(/```json/gi, "").replace(/```/g, "").trim();
-  let parsed: any = null;
+  if (
+    status === 401 ||
+    /api key not valid|invalid api key|unauthenticated|authentication credential/.test(normalized)
+  ) {
+    return "Gemini rejected the configured API key. Replace GEMINI_API_KEY in Vercel with a current Google AI Studio key, then redeploy.";
+  }
+  if (
+    status === 403 ||
+    /permission denied|permission_denied|access restricted|not authorized/.test(normalized)
+  ) {
+    return "Gemini denied access for this API key. Confirm the key's Google Cloud project has Gemini API access and free-tier availability, then redeploy.";
+  }
+  if (status === 429 || /resource_exhausted|quota|rate limit|too many requests/.test(normalized)) {
+    return "The free Gemini quota or rate limit was reached. Wait for the quota to reset; official ATS sources can still be scanned without paid grounding.";
+  }
+  if (status === 404 || /model.+not found|not found.+model|not supported for generatecontent/.test(normalized)) {
+    return `Gemini model ${MODEL} is unavailable to this API key. Set GEMINI_MODEL to an available stable Flash model in Vercel, then redeploy.`;
+  }
+  if (/timeout|timed out|deadline|aborterror/.test(normalized)) {
+    return "The Gemini request timed out before the scan completed. Please retry this employer.";
+  }
+  if ([502, 503, 504].includes(status || 0)) {
+    return "Gemini is temporarily unavailable after retries. Try this employer again later; no paid upgrade is required for this error.";
+  }
+  if (status === 400) {
+    return `Gemini rejected the scan request (400) for model ${MODEL}. Check the Vercel function logs for the upstream validation message.`;
+  }
+
+  return status
+    ? `Gemini could not complete the scan (upstream status ${status}). Check the Vercel function logs for details.`
+    : "Gemini could not complete the scan. Check the Vercel function logs for details.";
+}
+
+function normalizeHttpUrl(value: unknown, baseUrl?: string): string | null {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
 
   try {
-    parsed = JSON.parse(cleanText);
-  } catch (e) {
-    const start = cleanText.indexOf("[");
-    const end = cleanText.lastIndexOf("]");
-    if (start !== -1 && end > start) {
-      try {
-        parsed = JSON.parse(cleanText.substring(start, end + 1));
-      } catch (err) {}
+    const url = baseUrl ? new URL(raw, baseUrl) : new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    url.hash = "";
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function comparableUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    url.hostname = url.hostname.toLowerCase();
+    url.pathname = url.pathname.replace(/\/$/, "") || "/";
+    return url.href;
+  } catch {
+    return value;
+  }
+}
+
+function normalizeEvidence(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/&amp;/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isGreaterPhiladelphiaLocation(city: string, state: string, postalCode: string): boolean {
+  const normalizedCity = normalizeEvidence(city);
+  const normalizedState = state.trim().toUpperCase();
+  if (normalizedState !== "PA" && normalizedState !== "NJ") return false;
+  const localCities = [
+    "philadelphia", "wayne", "radnor", "king of prussia", "conshohocken", "malvern",
+    "west chester", "chester", "media", "bala cynwyd", "bryn mawr", "fort washington",
+    "horsham", "blue bell", "plymouth meeting", "norristown", "lansdale", "doylestown",
+    "newtown", "yardley", "bensalem", "trevose", "exton", "paoli", "berwyn",
+    "jenkintown", "willow grove", "camden", "cherry hill", "mount laurel", "moorestown",
+  ];
+  if (localCities.includes(normalizedCity)) {
+    return true;
+  }
+  return normalizedState === "NJ" && /^(080|081)/.test(postalCode.trim());
+}
+
+function getAdpCustomField(
+  requisition: Record<string, any>,
+  collection: "dateFields" | "stringFields",
+  code: string,
+): string {
+  const fields = requisition?.customFieldGroup?.[collection];
+  if (!Array.isArray(fields)) return "";
+  const field = fields.find((candidate: any) => candidate?.nameCode?.codeValue === code);
+  return String(field?.dateValue || field?.stringValue || "").trim();
+}
+
+/** Parses official ADP Workforce Now requisitions without requiring a search API. */
+export function parseAdpJobs(payload: unknown, boardUrl: string): ScannedJob[] {
+  const requisitions = (payload as any)?.jobRequisitions;
+  if (!Array.isArray(requisitions)) return [];
+
+  const jobs: ScannedJob[] = [];
+  for (const requisition of requisitions) {
+    const title = String(requisition?.requisitionTitle || "").trim();
+    const itemId = String(requisition?.itemID || requisition?.clientRequisitionID || "").trim();
+    const locations = Array.isArray(requisition?.requisitionLocations)
+      ? requisition.requisitionLocations
+      : [];
+    const localLocation = locations.find((location: any) => {
+      const address = location?.address || {};
+      return isGreaterPhiladelphiaLocation(
+        String(address.cityName || ""),
+        String(address.countrySubdivisionLevel1?.codeValue || ""),
+        String(address.postalCode || ""),
+      );
+    });
+    if (!title || !itemId || !localLocation) continue;
+
+    const address = localLocation.address || {};
+    const city = String(address.cityName || "").trim();
+    const state = String(address.countrySubdivisionLevel1?.codeValue || "").trim();
+    const titleStates = [...title.matchAll(/,\s*([A-Z]{2})\b/g)].map((match) => match[1]);
+    if (titleStates.length > 0 && !titleStates.includes(state.toUpperCase())) continue;
+
+    const jobUrl = new URL(boardUrl);
+    jobUrl.searchParams.set("jobId", itemId);
+    jobs.push({
+      title,
+      url: jobUrl.href,
+      location: [city, state].filter(Boolean).join(", "),
+      city,
+      roleType: String(requisition?.workLevelCode?.shortName || "Not specified").trim(),
+      postedDate: getAdpCustomField(requisition, "dateFields", "PostingDate") || String(requisition?.postDate || ""),
+      description: "",
+    });
+  }
+  return jobs;
+}
+
+async function fetchAdpJobs(boardUrl: string): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    const cid = board.searchParams.get("cid");
+    const ccId = board.searchParams.get("ccId");
+    if (!cid || !ccId) return [];
+
+    const endpoint = new URL("/mascsr/default/careercenter/public/events/staffing/v1/job-requisitions", board.origin);
+    endpoint.searchParams.set("cid", cid);
+    endpoint.searchParams.set("ccId", ccId);
+    endpoint.searchParams.set("lang", "en_US");
+    endpoint.searchParams.set("locale", "en_US");
+    endpoint.searchParams.set("$skip", "0");
+    endpoint.searchParams.set("$top", "100");
+    endpoint.searchParams.set("userQuery", "");
+
+    const response = await fetch(endpoint, {
+      headers: {
+        "Accept-Language": "en_US",
+        locale: "en_US",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/json",
+        "x-forwarded-host": board.hostname,
+      },
+      signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+    });
+    if (!response.ok) return [];
+    return parseAdpJobs(await response.json(), board.href);
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read ADP board ${boardUrl}:`, error);
+    return [];
+  }
+}
+
+/** Maps currently listed UKG Pro opportunities to their official detail pages. */
+export function parseUkgJobs(payload: unknown, boardUrl: string): ScannedJob[] {
+  const opportunities = (payload as any)?.opportunities;
+  if (!Array.isArray(opportunities)) return [];
+
+  const board = new URL(boardUrl);
+  board.search = "";
+  board.hash = "";
+  const jobs: ScannedJob[] = [];
+  const seen = new Set<string>();
+  for (const opportunity of opportunities) {
+    const id = String(opportunity?.Id || "");
+    const title = String(opportunity?.Title || "").trim();
+    if (!/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(id) || !title || seen.has(id)) continue;
+
+    const location = (Array.isArray(opportunity.Locations) ? opportunity.Locations : []).find((candidate: any) => {
+      const address = candidate?.Address || {};
+      return isGreaterPhiladelphiaLocation(
+        String(address.City || ""),
+        String(address.State?.Code || ""),
+        String(address.PostalCode || ""),
+      );
+    });
+    if (!location) continue;
+
+    const address = location.Address;
+    const city = String(address.City || "").trim();
+    const state = String(address.State.Code || "").trim();
+    const detailUrl = new URL("OpportunityDetail", board);
+    detailUrl.searchParams.set("opportunityId", id);
+    jobs.push({
+      title,
+      url: detailUrl.href,
+      location: `${city}, ${state}`,
+      city,
+      roleType: typeof opportunity.FullTime === "boolean"
+        ? opportunity.FullTime ? "Full-time" : "Part-time"
+        : "Not specified",
+      postedDate: String(opportunity.PostedDate || ""),
+      description: String(opportunity.BriefDescription || ""),
+    });
+    seen.add(id);
+  }
+  return jobs;
+}
+
+async function fetchUkgJobs(boardUrl: string): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    if (!board.hostname.toLowerCase().endsWith(".rec.pro.ukg.net")) return [];
+    const boardPath = board.pathname.match(/^\/(?:[^/]+)\/JobBoard\/[a-f\d-]{36}\//i);
+    if (!boardPath) return [];
+    const endpoint = new URL(`${boardPath[0]}JobBoardView/LoadSearchResults`, board.origin);
+    const jobs = new Map<string, ScannedJob>();
+    const pageSize = 200;
+    for (let page = 0; page < 5; page += 1) {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ opportunitySearch: { QueryString: "", Filters: [], Top: pageSize, Skip: page * pageSize } }),
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+      });
+      if (!response.ok) break;
+      const payload = await response.json();
+      for (const job of parseUkgJobs(payload, new URL(boardPath[0], board.origin).href)) {
+        jobs.set(job.url, job);
+      }
+      const received = Array.isArray(payload?.opportunities) ? payload.opportunities.length : 0;
+      if (!received || received < pageSize || (page + 1) * pageSize >= Number(payload?.totalCount || 0)) break;
+    }
+    return [...jobs.values()];
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read UKG board ${boardUrl}:`, error);
+    return [];
+  }
+}
+
+/** Taleo's public search response contains open requisitions, including their actual board IDs. */
+export function parseTaleoJobs(payload: unknown, boardUrl: string, districtLocation = false): ScannedJob[] {
+  const requisitions = (payload as any)?.requisitionList;
+  if (!Array.isArray(requisitions)) return [];
+  const board = new URL(boardUrl);
+  const jobs: ScannedJob[] = [];
+  for (const requisition of requisitions) {
+    const columns = requisition?.column;
+    if (!Array.isArray(columns)) continue;
+    const title = String(columns[0] || "").trim();
+    const contestNo = String(requisition?.contestNo || "").trim();
+    if (!title || !/^[\w-]{1,50}$/.test(contestNo)) continue;
+    let locations: unknown;
+    try {
+      const locationIndex = Array.isArray(requisition.locationsColumns) ? requisition.locationsColumns[0] : 2;
+      locations = JSON.parse(String(columns[locationIndex] || "[]"));
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(locations)) continue;
+    const local = locations.map((location) => String(location).match(/^United States-(Pennsylvania|New Jersey)-(.+)$/i))
+      .find((parts) => parts && isGreaterPhiladelphiaLocation(parts[2], parts[1].toLowerCase() === "pennsylvania" ? "PA" : "NJ", ""));
+    if (!local && !(districtLocation && board.hostname === "aa080.taleo.net" &&
+        board.pathname.includes("/sdp_external_career_section/") && locations.length > 0 &&
+        locations.every((location) => !/^(?:United States|Canada)-/i.test(String(location))))) continue;
+    const city = local ? local[2].trim() : "Philadelphia";
+    const state = local ? local[1].toLowerCase() === "pennsylvania" ? "PA" : "NJ" : "PA";
+    const school = !local && districtLocation ? String(locations[0]).trim() : "";
+    const detailUrl = new URL(board.pathname.replace(/jobsearch\.ftl$/i, "jobdetail.ftl"), board.origin);
+    detailUrl.searchParams.set("job", contestNo);
+    detailUrl.searchParams.set("lang", board.searchParams.get("lang") || "en");
+    jobs.push({ title, url: detailUrl.href, location: school ? `${school}, ${city}, ${state}` : `${city}, ${state}`, city,
+      roleType: "Not specified", postedDate: "", description: "" });
+  }
+  return jobs;
+}
+
+async function fetchTaleoJobs(boardUrl: string, districtLocation = false): Promise<ScannedJob[]> {
+  try {
+    const board = new URL(boardUrl);
+    if (!/(?:^|\.)taleo\.net$/i.test(board.hostname) ||
+        !/^\/careersection\/[^/]+\/jobsearch\.ftl$/i.test(board.pathname)) return [];
+    const boardResponse = await fetch(board, { signal: AbortSignal.timeout(READER_TIMEOUT_MS) });
+    if (!boardResponse.ok) return [];
+    const html = await boardResponse.text();
+    const portalNo = html.match(/\bportalNo\s*:\s*['"](\d+)['"]/i)?.[1];
+    if (!portalNo) return [];
+    const endpoint = new URL("/careersection/rest/jobboard/searchjobs", board.origin);
+    endpoint.searchParams.set("lang", board.searchParams.get("lang") || "en");
+    endpoint.searchParams.set("portal", portalNo);
+    const jobs = new Map<string, ScannedJob>();
+    for (let page = 1; page <= 10; page += 1) {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json", Referer: board.href,
+          tz: "0", tzname: "UTC" },
+        body: JSON.stringify({ pageNo: page }),
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+      });
+      if (!response.ok) break;
+      const payload = await response.json();
+      for (const job of parseTaleoJobs(payload, board.href, districtLocation)) jobs.set(job.url, job);
+      const paging = payload?.pagingData;
+      const count = Array.isArray(payload?.requisitionList) ? payload.requisitionList.length : 0;
+      if (!count || !Number.isFinite(Number(paging?.pageSize)) ||
+          page * Number(paging.pageSize) >= Number(paging?.totalCount || 0)) break;
+    }
+    return [...jobs.values()];
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read Taleo board ${boardUrl}:`, error);
+    return [];
+  }
+}
+
+async function extractStructuredAtsJobs(documents: SourceDocument[]): Promise<ScannedJob[]> {
+  const adpBoards = new Set<string>();
+  const ukgBoards = new Set<string>();
+  const taleoBoards = new Set<string>();
+  for (const document of documents) {
+    try {
+      for (const url of [document.url, ...extractLikelyCareerLinks(document)]) {
+        const board = new URL(url);
+        const hostname = board.hostname.toLowerCase();
+        if (hostname === "adp.com" || hostname.endsWith(".adp.com")) adpBoards.add(board.href);
+        if (hostname.endsWith(".rec.pro.ukg.net")) {
+          const boardPath = board.pathname.match(/^\/(?:[^/]+)\/JobBoard\/[a-f\d-]{36}\//i);
+          if (boardPath) ukgBoards.add(new URL(boardPath[0], board.origin).href);
+        }
+        if (/(?:^|\.)taleo\.net$/i.test(board.hostname) &&
+            /^\/careersection\/[^/]+\/jobsearch\.ftl$/i.test(board.pathname)) taleoBoards.add(board.href);
+      }
+    } catch {
+      // Ignore malformed source URLs; normal evidence extraction remains available.
+    }
+  }
+  for (const boardUrl of [...adpBoards].slice(0, 4)) {
+    const jobs = await fetchAdpJobs(boardUrl);
+    if (jobs.length > 0) return jobs;
+  }
+  for (const boardUrl of [...ukgBoards].slice(0, 4)) {
+    const jobs = await fetchUkgJobs(boardUrl);
+    if (jobs.length > 0) return jobs;
+  }
+  const jobs = new Map<string, ScannedJob>();
+  for (const boardUrl of [...taleoBoards].slice(0, 4)) {
+    const districtLocation = documents.some((document) => new URL(document.url).hostname === "jobs.philasd.org") &&
+      new URL(boardUrl).hostname === "aa080.taleo.net";
+    for (const job of await fetchTaleoJobs(boardUrl, districtLocation)) jobs.set(job.url, job);
+  }
+  return [...jobs.values()];
+}
+
+/** First-party HTML is enough to discover ATS links when the Reader is slow or unavailable. */
+async function fetchOfficialHtml(url: string): Promise<SourceDocument | null> {
+  const normalized = normalizeHttpUrl(url);
+  if (!normalized) return null;
+  const parsed = new URL(normalized);
+  if (parsed.protocol !== "https:" || !OFFICIAL_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+  try {
+    const initialHost = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const signal = AbortSignal.timeout(DIRECT_TIMEOUT_MS);
+    let current = parsed;
+    for (let redirects = 0; redirects <= 2; redirects += 1) {
+      const response = await fetch(current, {
+        headers: { Accept: "text/html" }, redirect: "manual", signal,
+      });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get("location");
+        if (!location) return null;
+        const next = new URL(location, current);
+        if (next.protocol !== "https:" || next.hostname.toLowerCase().replace(/^www\./, "") !== initialHost ||
+            next.username || next.password) return null;
+        current = next;
+        continue;
+      }
+      if (!response.ok || !/text\/html/i.test(response.headers.get("content-type") || "")) return null;
+      const text = (await response.text()).slice(0, 300_000);
+      return text.length >= 120 ? { url: current.href, text } : null;
+    }
+    return null;
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read official HTML for ${normalized}:`, error);
+    return null;
+  }
+}
+
+function extractDocumentUrls(document: SourceDocument): Set<string> {
+  const urls = new Set<string>([comparableUrl(document.url)]);
+  const candidates = document.text.match(/https?:\/\/[^\s<>"')\]]+/gi) || [];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeHttpUrl(candidate.replace(/[.,;:!?]+$/, ""));
+    if (normalized) urls.add(comparableUrl(normalized));
+  }
+
+  for (const match of document.text.matchAll(/\]\(([^)]+)\)/g)) {
+    const normalized = normalizeHttpUrl(match[1], document.url);
+    if (normalized) urls.add(comparableUrl(normalized));
+  }
+
+  return urls;
+}
+
+/** Returns the strongest job-board and ATS links exposed by a careers page. */
+export function extractLikelyCareerLinks(document: SourceDocument): string[] {
+  const scored = new Map<string, number>();
+  const sourceUrl = normalizeHttpUrl(document.url);
+  const sourceHost = sourceUrl ? new URL(sourceUrl).hostname : "";
+
+  const scoreLink = (rawLabel: string, rawUrl: string) => {
+    const label = normalizeEvidence(rawLabel.replace(/<[^>]+>/g, " "));
+    const url = normalizeHttpUrl(rawUrl.replace(/&amp;/gi, "&"), document.url);
+    if (!url || comparableUrl(url) === comparableUrl(document.url)) return;
+
+    const parsed = new URL(url);
+    if (/\.(?:css|js|jpe?g|png|gif|svg|webp|pdf|mp4)$/i.test(parsed.pathname)) return;
+    if (/facebook|instagram|linkedin|twitter|youtube|vimeo|google\.com\/maps/i.test(parsed.hostname + parsed.pathname)) return;
+
+    let score = 0;
+    if (ATS_HOST_PATTERN.test(parsed.hostname)) score += 100;
+    if (/open positions?|current openings?|view all jobs?|search (?:and )?apply|search jobs?|external candidate|career site|apply now/.test(label)) score += 80;
+    if (/\/(?:job|jobs|careers?|employment)(?:\/|$)|careersection|jobsearch|recruitment|view-all-jobs/i.test(parsed.pathname)) score += 45;
+    if (/\/job(?:-invite)?\//i.test(parsed.pathname)) score += 35;
+    if (parsed.hostname === sourceHost) score += 10;
+    if (/how-we-hire|applicant-tips|benefits|diversity|ethics|privacy|talent-community/i.test(parsed.pathname)) score -= 80;
+
+    if (score >= 55) scored.set(url, Math.max(score, scored.get(url) || 0));
+  };
+
+  for (const match of document.text.matchAll(/\[([^\]]*)\]\(([^\s)]+)(?:\s+["'][^"']*["'])?\)/gi)) {
+    scoreLink(match[1], match[2]);
+  }
+  for (const match of document.text.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    scoreLink(match[2], match[1]);
+  }
+
+  return [...scored.entries()]
+    .sort(([, left], [, right]) => right - left)
+    .map(([url]) => url);
+}
+
+function containsClosedEvidence(documentText: string, title: string): boolean {
+  const needle = normalizeEvidence(title);
+  const closedPhrases = [
+    "no longer accepting applications",
+    "no longer available",
+    "position has been filled",
+    "posting has expired",
+    "job has expired",
+    "applications are closed",
+  ];
+  const lines = documentText.split(/\r?\n/);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!normalizeEvidence(lines[index]).includes(needle)) continue;
+    const block = [lines[index]];
+    for (let offset = 1; offset <= 3 && index + offset < lines.length; offset += 1) {
+      if (!lines[index + offset].trim()) break;
+      block.push(lines[index + offset]);
+    }
+    const nearby = normalizeEvidence(block.join(" "));
+    if (closedPhrases.some((phrase) => nearby.includes(phrase))) return true;
+  }
+
+  return false;
+}
+
+function parseJsonArray(rawText: string): unknown[] {
+  if (!rawText) return [];
+  const text = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+
+  const attempts = [text];
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  if (start >= 0 && end > start) attempts.push(text.slice(start, end + 1));
+
+  for (const attempt of attempts) {
+    try {
+      const parsed = JSON.parse(attempt);
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && typeof parsed === "object" && Array.isArray((parsed as any).jobs)) {
+        return (parsed as any).jobs;
+      }
+    } catch {
+      // Invalid model output is not evidence. Try the next bounded representation.
     }
   }
 
-  const jobs = Array.isArray(parsed) ? parsed : (parsed?.jobs || []);
-  const today = new Date().toISOString().split("T")[0];
-
-  return jobs
-    .map((j: any) => {
-      let url = String(j.url || baseUrl).trim();
-      if (url.startsWith("mailto:")) {
-        url = baseUrl;
-      } else if (!url.startsWith("http")) {
-        try {
-          url = new URL(url, baseUrl.startsWith("http") ? baseUrl : `https://${baseUrl}`).href;
-        } catch (e) {
-          url = baseUrl;
-        }
-      }
-
-      return {
-        title: String(j.title || "Unknown Title").trim(),
-        url: url,
-        location: String(j.location || "Philadelphia, PA").trim(),
-        city: String(j.city || "Philadelphia").trim(),
-        roleType: String(j.roleType || "Full-time").trim(),
-        postedDate: String(j.postedDate || today).trim(),
-        description: String(j.description || "").trim(),
-      };
-    })
-    .filter((j: any) => j.title !== "Unknown Title" && !j.title.toLowerCase().includes("no job"));
+  return [];
 }
 
-export async function scanJobsForEmployer(employerName: string, website: string, existingTitles: string[]) {
-  const ai = getAIClient();
-  if (!ai) {
-    return { error: "GEMINI_API_KEY is missing or invalid in Vercel Environment Variables." };
+/**
+ * Converts model output to jobs only when the title and URL are present in a
+ * fetched source document. This is the final guard against plausible but
+ * invented model output.
+ */
+export function parseEvidenceBackedJobs(rawText: string, documents: SourceDocument[]): ScannedJob[] {
+  const documentIndex = new Map(
+    documents.map((document) => [comparableUrl(document.url), {
+      ...document,
+      normalizedText: normalizeEvidence(document.text),
+      urls: extractDocumentUrls(document),
+    }]),
+  );
+  const deduplicated = new Map<string, ScannedJob>();
+
+  for (const item of parseJsonArray(rawText)) {
+    if (!item || typeof item !== "object") continue;
+    const candidate = item as Record<string, unknown>;
+    const title = String(candidate.title || "").trim();
+    const sourceUrl = normalizeHttpUrl(candidate.sourceUrl);
+    if (!title || !sourceUrl) continue;
+
+    const source = documentIndex.get(comparableUrl(sourceUrl));
+    if (!source || !source.normalizedText.includes(normalizeEvidence(title))) continue;
+    if (containsClosedEvidence(source.text, title)) continue;
+
+    const jobUrl = normalizeHttpUrl(candidate.url, source.url) || source.url;
+    if (!source.urls.has(comparableUrl(jobUrl))) continue;
+
+    const location = String(candidate.location || "").trim();
+    const job: ScannedJob = {
+      title,
+      url: jobUrl,
+      location,
+      city: String(candidate.city || "").trim(),
+      roleType: String(candidate.roleType || "Not specified").trim(),
+      postedDate: String(candidate.postedDate || "").trim(),
+      description: String(candidate.description || "").trim(),
+    };
+    const key = `${normalizeEvidence(title)}|${normalizeEvidence(location)}`;
+    if (!deduplicated.has(key)) deduplicated.set(key, job);
   }
 
-  const targetUrl = website && website.startsWith("http") ? website : `https://${website || "wacphila.org/join-our-team/"}`;
-  let jobs: ScannedJob[] = [];
+  return [...deduplicated.values()];
+}
 
-  // Failsafe bypass for World Affairs Council
-  if (employerName.toLowerCase().includes("world affairs council")) {
+async function fetchReadablePage(url: string): Promise<SourceDocument | null> {
+  const normalized = normalizeHttpUrl(url);
+  if (!normalized) return null;
+
+  try {
+    const readerUrl = `https://r.jina.ai/${normalized}`;
+    let response = await fetch(readerUrl, {
+      headers: {
+        Accept: "text/plain",
+        "X-With-Links-Summary": "all",
+        "X-With-Iframe": "true",
+      },
+      signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+    });
+    // Some sites reject advanced rendering options even though basic Reader works.
+    if ([400, 401, 422].includes(response.status)) {
+      response = await fetch(readerUrl, {
+        headers: { Accept: "text/plain", "X-Respond-With": "html" },
+        signal: AbortSignal.timeout(READER_TIMEOUT_MS),
+      });
+    }
+    if (!response.ok) return null;
+
+    const text = (await response.text()).trim();
+    if (
+      text.length < 120 ||
+      /403 forbidden|just a moment|access denied|captcha/i.test(text.slice(0, 2_000))
+    ) {
+      return null;
+    }
+
+    return { url: normalized, text };
+  } catch (error) {
+    console.warn(`[Job scanner] Could not read ${normalized}:`, error);
+    return null;
+  }
+}
+
+async function collectCareerDocuments(root: SourceDocument): Promise<SourceDocument[]> {
+  const documents = [root];
+  const visited = new Set<string>([comparableUrl(root.url)]);
+  let frontier = extractLikelyCareerLinks(root);
+
+  for (let depth = 0; depth < 2 && frontier.length > 0 && documents.length < MAX_SOURCE_DOCUMENTS; depth += 1) {
+    const remaining = MAX_SOURCE_DOCUMENTS - documents.length;
+    const batch = frontier
+      .filter((url) => !visited.has(comparableUrl(url)))
+      .slice(0, Math.min(2, remaining));
+    batch.forEach((url) => visited.add(comparableUrl(url)));
+
+    const fetched = (await Promise.all(batch.map(async (url) =>
+      await fetchReadablePage(url) || await fetchOfficialHtml(url))))
+      .filter((document): document is SourceDocument => Boolean(document));
+    documents.push(...fetched);
+    frontier = fetched
+      .flatMap(extractLikelyCareerLinks)
+      .filter((url) => !visited.has(comparableUrl(url)));
+  }
+
+  return documents;
+}
+
+function fitDocumentToBudget(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  const headLength = Math.floor(budget * 0.6);
+  const tailLength = budget - headLength;
+  return `${text.slice(0, headLength)}\n\n[...middle omitted...]\n\n${text.slice(-tailLength)}`;
+}
+
+function buildExtractionPrompt(employerName: string, documents: SourceDocument[]): string {
+  const perDocumentBudget = Math.floor(MAX_DOCUMENT_CHARS / Math.max(1, documents.length));
+  const sources = documents.map((document, index) =>
+    `SOURCE ${index + 1}\nSOURCE_URL: ${document.url}\n${fitDocumentToBudget(document.text, perDocumentBudget)}`,
+  ).join("\n\n---\n\n");
+
+  return `Extract currently open jobs for "${employerName}" in Greater Philadelphia from the supplied sources.
+
+Evidence rules:
+- Return only positions explicitly shown as open in a source. Never infer or invent a role.
+- Exclude expired, filled, closed, archived, generic talent-network, and search-category entries.
+- Prefer the direct job-detail/application URL shown in that same source. If the source itself is the detail page, use SOURCE_URL.
+- Copy the exact job title. Do not rewrite it.
+- Include only Philadelphia, Southeastern Pennsylvania, or Camden/South Jersey roles. Include remote roles only when the source says applicants in this region are eligible.
+- Copy dates, locations, employment types, and descriptions only when stated; otherwise use an empty string.
+- sourceUrl must exactly equal the SOURCE_URL containing the evidence.
+- An empty array is correct when there is not enough evidence.
+
+Return only a JSON array with title, url, sourceUrl, location, city, roleType, postedDate, and description.
+
+${sources}`;
+}
+
+const extractionSchema = {
+  type: Type.ARRAY,
+  items: {
+    type: Type.OBJECT,
+    properties: {
+      title: { type: Type.STRING },
+      url: { type: Type.STRING },
+      sourceUrl: { type: Type.STRING },
+      location: { type: Type.STRING },
+      city: { type: Type.STRING },
+      roleType: { type: Type.STRING },
+      postedDate: { type: Type.STRING },
+      description: { type: Type.STRING },
+    },
+    required: ["title", "url", "sourceUrl", "location", "city", "roleType", "postedDate", "description"],
+  },
+};
+
+/** Retry only transient upstream failures; quota and authentication must not be retried. */
+export async function requestGeminiWithRetry<T>(request: () => Promise<T>, delayMs = 600): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await request();
+    } catch (error) {
+      const candidate = error as { status?: number; code?: number };
+      if (attempt >= 2 || ![502, 503, 504].includes(Number(candidate?.status || candidate?.code))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs * 2 ** attempt));
+    }
+  }
+}
+
+async function extractJobs(ai: GoogleGenAI, employerName: string, documents: SourceDocument[]): Promise<ScannedJob[]> {
+  if (documents.length === 0) return [];
+  const response = await requestGeminiWithRetry(() => ai.models.generateContent({
+    model: MODEL,
+    contents: buildExtractionPrompt(employerName, documents),
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: extractionSchema,
+    },
+  }));
+  return parseEvidenceBackedJobs(response.text || "", documents);
+}
+
+async function discoverCandidateUrls(ai: GoogleGenAI, employerName: string, website: string): Promise<string[]> {
+  const response: any = await requestGeminiWithRetry(() => ai.models.generateContent({
+    model: MODEL,
+    contents: `Find official, currently open job-detail or job-search pages for "${employerName}" in Greater Philadelphia. The employer website is ${website}. Focus on the employer's site and its official applicant-tracking system. Do not use job-description aggregators or old cached postings.`,
+    config: { tools: [{ googleSearch: {} }] },
+  }));
+
+  const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  const urls = new Set<string>();
+  for (const chunk of chunks) {
+    const url = normalizeHttpUrl(chunk?.web?.uri);
+    if (url) urls.add(url);
+    if (urls.size >= 6) break;
+  }
+  return [...urls];
+}
+
+export async function scanJobsForEmployer(
+  employerName: string,
+  website: string,
+  _existingTitles: string[] = [],
+): Promise<ScanJobsResult> {
+  const targetUrl = normalizeHttpUrl(website);
+  if (!targetUrl) {
     return {
-      jobs: [
-        {
-          title: "Chief External Affairs Officer",
-          url: "https://wacphila.org/join-our-team/",
-          location: "Philadelphia, PA",
-          city: "Philadelphia",
-          roleType: "Full-time",
-          postedDate: new Date().toISOString().split("T")[0],
-          description: "Lead strategist and steward of fundraising, public profile, and revenue generation."
-        },
-        {
-          title: "Global Smarts Program Mentor",
-          url: "https://wacphila.org/join-our-team/",
-          location: "Philadelphia, PA",
-          city: "Philadelphia",
-          roleType: "Internship",
-          postedDate: new Date().toISOString().split("T")[0],
-          description: "Support middle school students in developing skills for Jr. Model UN."
-        },
-        {
-          title: "Graphic Design & Social Media Intern",
-          url: "https://wacphila.org/join-our-team/",
-          location: "Philadelphia, PA",
-          city: "Philadelphia",
-          roleType: "Internship",
-          postedDate: new Date().toISOString().split("T")[0],
-          description: "Design promotional materials and create compelling graphics for social media campaigns."
-        },
-        {
-          title: "Professional Exchanges Intern",
-          url: "https://wacphila.org/join-our-team/",
-          location: "Philadelphia, PA",
-          city: "Philadelphia",
-          roleType: "Internship",
-          postedDate: new Date().toISOString().split("T")[0],
-          description: "Support itinerary development and logistical planning for international guests."
-        },
-        {
-          title: "Youth Programming Intern",
-          url: "https://wacphila.org/join-our-team/",
-          location: "Philadelphia, PA",
-          city: "Philadelphia",
-          roleType: "Internship",
-          postedDate: new Date().toISOString().split("T")[0],
-          description: "Support the development and implementation of middle and high school global education programs."
-        }
-      ],
-      source: "hardcoded-bypass"
+      jobs: [],
+      source: "no-jobs-found",
+      authoritative: false,
+      error: "A valid http(s) employer website is required.",
     };
   }
 
-  // Attempt live web scrape via Jina Reader
-  try {
-    const res = await fetch(`https://r.jina.ai/${targetUrl}`, { headers: { "Accept": "text/plain" } });
-    if (res.ok) {
-      const text = await res.text();
-      if (text.length > 200 && !text.includes("403 Forbidden") && !text.includes("Just a moment")) {
-        const prompt = `Extract all active job openings for "${employerName}" from this webpage text.
-Return ONLY a JSON array formatted like:
-[
-  {
-    "title": "Job Title",
-    "url": "${targetUrl}",
-    "location": "Philadelphia, PA",
-    "city": "Philadelphia",
-    "roleType": "Full-time",
-    "postedDate": "2026-09-22",
-    "description": "Short description"
+  let lastWarning = "No evidence-backed open positions were found.";
+  let lastError: unknown = null;
+  const officialUrl = LEGACY_CAREER_URLS.get(comparableUrl(targetUrl)) || targetUrl;
+  const directDocument = await fetchOfficialHtml(officialUrl);
+  if (directDocument) {
+    const directJobs = await extractStructuredAtsJobs([directDocument]);
+    if (directJobs.length > 0) {
+      return { jobs: directJobs, source: "official-page", authoritative: true };
+    }
   }
-]
+  const officialDocument = await fetchReadablePage(officialUrl);
+  let documents: SourceDocument[] = directDocument ? [directDocument] : [];
+  if (officialDocument) {
+    try {
+      documents = await collectCareerDocuments(officialDocument);
+      if (directDocument) documents.push(directDocument);
+      const structuredJobs = await extractStructuredAtsJobs(documents);
+      if (structuredJobs.length > 0) {
+        return { jobs: structuredJobs, source: "official-page", authoritative: true };
+      }
+    } catch (error) {
+      console.warn(`[Job scanner] Official-source discovery failed for ${employerName}:`, error);
+    }
+  } else if (directDocument) {
+    documents = await collectCareerDocuments(directDocument);
+    const structuredJobs = await extractStructuredAtsJobs(documents);
+    if (structuredJobs.length > 0) {
+      return { jobs: structuredJobs, source: "official-page", authoritative: true };
+    }
+  }
 
-Webpage text:
-${text.slice(0, 15000)}`;
+  const ai = getAIClient();
+  if (!ai) {
+    return { jobs: [], source: "no-jobs-found", authoritative: false,
+      error: "GEMINI_API_KEY is missing or invalid in the server environment." };
+  }
+  if (documents.length > 0) {
+    try {
+      const jobs = await extractJobs(ai, employerName, documents);
+      lastError = null;
+      if (jobs.length > 0) {
+        return { jobs, source: "official-page", authoritative: true };
+      }
+    } catch (error: any) {
+      lastError = error;
+      lastWarning = error?.message || "Could not extract jobs from the official page.";
+      console.warn(`[Job scanner] Official-page extraction failed for ${employerName}:`, error);
+    }
+  }
 
-        const response = await ai.models.generateContent({
-          model: "gemini-2.0-flash",
-          contents: prompt
-        });
-
-        if (response?.text) {
-          jobs = cleanAndParseJSON(response.text, targetUrl);
+  if (SEARCH_GROUNDING_ENABLED) {
+    try {
+      const candidateUrls = await discoverCandidateUrls(ai, employerName, officialUrl);
+      const candidateDocuments = (await Promise.all(candidateUrls.map(fetchReadablePage)))
+        .filter((document): document is SourceDocument => Boolean(document));
+      if (candidateDocuments.length > 0) {
+        const jobs = await extractJobs(ai, employerName, candidateDocuments);
+        lastError = null;
+        if (jobs.length > 0) {
+          return { jobs, source: "grounded-pages", authoritative: false };
         }
       }
+    } catch (error: any) {
+      lastError = error;
+      lastWarning = error?.message || "Grounded job-page discovery failed.";
+      console.warn(`[Job scanner] Grounded discovery failed for ${employerName}:`, error);
     }
-  } catch (e) {
-    console.error("Scraping error:", e);
+  } else if (!lastError) {
+    lastWarning = documents.length > 0
+      ? "Could not verify open regional positions from the available official pages. Paid search fallback is disabled; this does not mean the employer has no openings."
+      : "Could not read the employer's official careers page. Check its website URL; the scan was not verified.";
   }
 
-  // Google Search Fallback if scraping returned 0 jobs
-  if (jobs.length === 0) {
-    try {
-      const searchPrompt = `Search Google for active job openings at "${employerName}" in Philadelphia, PA. List all active open positions found. Return ONLY a JSON array.`;
-      const searchRes: any = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: searchPrompt,
-        config: { tools: [{ googleSearch: {} }] }
-      });
-
-      if (searchRes?.text) {
-        jobs = cleanAndParseJSON(searchRes.text, targetUrl);
-      }
-    } catch (e) {
-      console.error("Search grounding fallback error:", e);
-    }
+  if (lastError) {
+    return {
+      jobs: [],
+      source: "no-jobs-found",
+      authoritative: false,
+      error: describeGeminiError(lastError),
+    };
   }
 
-  return { jobs, source: jobs.length > 0 ? "live-scrape" : "no-jobs-found" };
+  return {
+    jobs: [],
+    source: "no-jobs-found",
+    authoritative: false,
+    warning: lastWarning,
+  };
 }

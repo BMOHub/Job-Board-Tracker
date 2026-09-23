@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   collection, 
   onSnapshot, 
@@ -11,6 +11,7 @@ import {
   setDoc, 
   doc, 
   limit, 
+  startAfter,
   deleteDoc 
 } from 'firebase/firestore';
 import { 
@@ -45,7 +46,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { db } from './lib/firebase';
 import { INITIAL_EMPLOYERS } from './constants';
-import { scanJobsForEmployer, isGeminiConfigured } from './services/jobScanner';
+import { scanJobsForEmployer, isGeminiConfigured, isVerifiedScanResult } from './services/jobScanner';
 
 const ADMIN_PASSWORD = "twcWR2026";
 
@@ -75,10 +76,20 @@ interface JobPosting {
   description?: string;
 }
 
+const jobIdentity = (title: string, location?: string) =>
+  `${title.trim().toLowerCase()}|${(location || '').trim().toLowerCase()}`;
+
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [employers, setEmployers] = useState<Employer[]>([]);
-  const [jobs, setJobs] = useState<JobPosting[]>([]);
+  const [recentJobs, setRecentJobs] = useState<JobPosting[]>([]);
+  const [olderJobs, setOlderJobs] = useState<JobPosting[]>([]);
+  const [hasMoreJobs, setHasMoreJobs] = useState(false);
+  const [loadingMoreJobs, setLoadingMoreJobs] = useState(false);
+  const olderCursorRef = useRef<any>(null);
+  const jobs = useMemo(() => [...new Map(
+    [...olderJobs, ...recentJobs].map(job => [job.id, job])
+  ).values()], [recentJobs, olderJobs]);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [selectedRoleType, setSelectedRoleType] = useState('All');
@@ -189,7 +200,11 @@ export default function App() {
     const qJobs = query(collection(db, 'jobPostings'), orderBy('foundDate', 'desc'), limit(250));
     const unsubscribeJobs = onSnapshot(qJobs, (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as JobPosting));
-      setJobs(data);
+      setRecentJobs(data);
+      // Live refreshes can reorder jobs, so discard stale older pages and reset their cursor.
+      setOlderJobs([]);
+      olderCursorRef.current = snapshot.docs.at(-1) || null;
+      setHasMoreJobs(snapshot.docs.length === 250);
     }, (error) => {
       console.error("Jobs Listener Failed:", error);
     });
@@ -199,6 +214,26 @@ export default function App() {
       unsubscribeJobs();
     };
   }, []);
+
+  const loadMoreJobs = async () => {
+    const cursor = olderCursorRef.current;
+    if (!cursor || !hasMoreJobs || loadingMoreJobs) return;
+    setLoadingMoreJobs(true);
+    try {
+      const page = await getDocs(query(collection(db, 'jobPostings'),
+        orderBy('foundDate', 'desc'), startAfter(cursor), limit(250)));
+      if (olderCursorRef.current !== cursor) return; // A live refresh invalidated this page.
+      setOlderJobs(previous => [...previous,
+        ...page.docs.map(doc => ({ id: doc.id, ...doc.data() } as JobPosting))]);
+      olderCursorRef.current = page.docs.at(-1) || null;
+      setHasMoreJobs(page.docs.length === 250);
+    } catch (error) {
+      console.error('Could not load older job postings:', error);
+      setScanError('Could not load older postings. Please retry.');
+    } finally {
+      setLoadingMoreJobs(false);
+    }
+  };
 
   const seedEmployers = async () => {
     try {
@@ -312,7 +347,9 @@ export default function App() {
     });
 
     let scanFailedCount = 0;
+    let scanSucceededCount = 0;
     let totalNewJobsAdded = 0;
+    let lastScanFailure = '';
 
     for (let i = 0; i < targetEmployers.length; i++) {
       if (abortControllerRef.current) break;
@@ -325,10 +362,9 @@ export default function App() {
         category: mode === 'category' ? (categoryName || selectedCategory) : undefined 
       });
       
-      let retryCount = 0;
       let success = false;
 
-      while (!success && retryCount < 2 && !abortControllerRef.current) {
+      while (!success && !abortControllerRef.current) {
         try {
           // Get existing postings for this employer to track existing titles and update them
           const existingDocs = await getDocs(query(
@@ -336,45 +372,52 @@ export default function App() {
             where('employerId', '==', employer.id)
           ));
           
-          const existingDocsByTitle = new Map<string, any>();
+          const existingDocsByIdentity = new Map<string, any>();
           existingDocs.docs.forEach(d => {
-            const t = (d.data().title || '').trim().toLowerCase();
-            if (t) existingDocsByTitle.set(t, d);
+            const data = d.data();
+            const identity = jobIdentity(data.title || '', data.location);
+            if (data.title?.trim()) existingDocsByIdentity.set(identity, d);
           });
           
-          const existingTitleList = Array.from(existingDocsByTitle.keys());
-          const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+          const existingTitleList = [...new Set(existingDocs.docs
+            .map(d => (d.data().title || '').trim())
+            .filter(Boolean))];
+          const scanResult = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+          if (!isVerifiedScanResult(scanResult)) {
+            throw new Error(scanResult.warning || 'Could not verify current openings from the official source.');
+          }
+          const foundJobs = scanResult.jobs;
           let employerNewJobs = 0;
           let employerRefreshedJobs = 0;
           
           for (const job of foundJobs) {
             if (abortControllerRef.current) break;
             const cleanTitle = (job.title || '').trim();
-            const normalizedTitle = cleanTitle.toLowerCase();
-            if (!normalizedTitle) continue;
+            if (!cleanTitle) continue;
+            const identity = jobIdentity(cleanTitle, job.location);
 
             const postedDate = job.postedDate ? new Date(job.postedDate) : null;
             const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
-            if (!existingDocsByTitle.has(normalizedTitle)) {
+            if (!existingDocsByIdentity.has(identity)) {
               await addDoc(collection(db, 'jobPostings'), {
                 employerId: employer.id,
                 employerName: employer.name,
                 title: cleanTitle,
-                location: job.location || 'Philadelphia, PA',
-                city: job.city || 'Philadelphia',
-                roleType: job.roleType || 'Full-time',
-                url: job.url || employer.website || 'https://www.google.com/search?q=' + encodeURIComponent(employer.name + ' careers philadelphia'),
+                location: job.location || 'Not specified',
+                city: job.city || 'Not specified',
+                roleType: job.roleType || 'Not specified',
+                url: job.url,
                 postedDate: validPostedDate,
                 foundDate: serverTimestamp(),
                 description: job.description || ''
               });
-              existingDocsByTitle.set(normalizedTitle, true);
+              existingDocsByIdentity.set(identity, true);
               employerNewJobs++;
               totalNewJobsAdded++;
             } else {
               // Existing posting is re-verified active
-              const existingDocObj = existingDocsByTitle.get(normalizedTitle);
+              const existingDocObj = existingDocsByIdentity.get(identity);
               if (existingDocObj && existingDocObj.id) {
                 await setDoc(doc(db, 'jobPostings', existingDocObj.id), {
                   foundDate: serverTimestamp(),
@@ -396,24 +439,17 @@ export default function App() {
           const errMsg = error?.message || String(error);
           const isRateLimit = errMsg.includes("429") || errMsg.includes("RESOURCE_EXHAUSTED") || errMsg.includes("quota") || errMsg.includes("rate limit");
 
-          if (isRateLimit && retryCount < 1 && !abortControllerRef.current) {
-            retryCount++;
-            console.warn(`[API Pacing] Pausing 8s before retrying ${employer.name}...`);
-            for (let c = 8; c > 0; c--) {
-              if (abortControllerRef.current) break;
-              setCooldownCountdown(c);
-              await new Promise(r => setTimeout(r, 1000));
-            }
-            setCooldownCountdown(null);
-            continue;
-          }
-
           console.error(`Error scanning ${employer.name}:`, error);
           scanFailedCount++;
-          setScanError(`Scan notice: ${employer.name} had a temporary timeout. Continuing with remaining partners...`);
+          lastScanFailure = errMsg;
+          setScanError(isRateLimit
+            ? `Scan notice: ${employer.name} reached the free Gemini limit. Continuing so official ATS sources can still be checked...`
+            : `Scan notice: ${employer.name}: ${errMsg} Continuing with remaining partners...`);
           break;
         }
       }
+
+      if (success) scanSucceededCount++;
 
       // Safe, brisk inter-request pacing: 2.5 seconds between employers
       if (i < targetEmployers.length - 1 && !abortControllerRef.current) {
@@ -422,9 +458,11 @@ export default function App() {
     }
 
     setCooldownCountdown(null);
-    setScanError(null);
     if (!abortControllerRef.current) {
-      setScanSuccessMsg(`Scan complete: Synced ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
+      setScanError(scanFailedCount > 0
+        ? `${scanFailedCount} employer scan(s) could not be verified. Verified scans continued; unverified partners were not marked as scanned. Last error: ${lastScanFailure}`
+        : null);
+      setScanSuccessMsg(`Scan complete: Synced ${scanSucceededCount} of ${targetEmployers.length} partner employer(s). Discovered ${totalNewJobsAdded} new job posting(s).`);
     }
     setIsScanning(false);
     setScanProgress({ current: 0, total: 0, employer: '' });
@@ -443,6 +481,7 @@ export default function App() {
     let newJobsCount = 0;
     let refreshedJobsCount = 0;
     let totalFound = 0;
+    let scanWarning: string | undefined;
 
     while (!success && retryCount < 2 && !abortControllerRef.current) {
       try {
@@ -452,43 +491,51 @@ export default function App() {
           where('employerId', '==', employer.id)
         ));
         
-        const existingDocsByTitle = new Map<string, any>();
+        const existingDocsByIdentity = new Map<string, any>();
         existingDocs.docs.forEach(d => {
-          const t = (d.data().title || '').trim().toLowerCase();
-          if (t) existingDocsByTitle.set(t, d);
+          const data = d.data();
+          const identity = jobIdentity(data.title || '', data.location);
+          if (data.title?.trim()) existingDocsByIdentity.set(identity, d);
         });
 
-        const existingTitleList = Array.from(existingDocsByTitle.keys());
-        const foundJobs = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+        const existingTitleList = [...new Set(existingDocs.docs
+          .map(d => (d.data().title || '').trim())
+          .filter(Boolean))];
+        const scanResult = await scanJobsForEmployer(employer.name, employer.website || '', existingTitleList);
+        if (!isVerifiedScanResult(scanResult)) {
+          throw new Error(scanResult.warning || 'Could not verify current openings from the official source.');
+        }
+        const foundJobs = scanResult.jobs;
+        scanWarning = scanResult.warning;
         totalFound = foundJobs.length;
 
         for (const job of foundJobs) {
           if (abortControllerRef.current) break;
           const cleanTitle = (job.title || '').trim();
-          const normalizedTitle = cleanTitle.toLowerCase();
-          if (!normalizedTitle) continue;
+          if (!cleanTitle) continue;
+          const identity = jobIdentity(cleanTitle, job.location);
 
           const postedDate = job.postedDate ? new Date(job.postedDate) : null;
           const validPostedDate = (postedDate && !isNaN(postedDate.getTime())) ? postedDate : null;
 
-          if (!existingDocsByTitle.has(normalizedTitle)) {
+          if (!existingDocsByIdentity.has(identity)) {
             await addDoc(collection(db, 'jobPostings'), {
               employerId: employer.id,
               employerName: employer.name,
               title: cleanTitle,
-              location: job.location || 'Philadelphia, PA',
-              city: job.city || 'Philadelphia',
-              roleType: job.roleType || 'Full-time',
-              url: job.url || employer.website || 'https://www.google.com/search?q=' + encodeURIComponent(employer.name + ' careers philadelphia'),
+              location: job.location || 'Not specified',
+              city: job.city || 'Not specified',
+              roleType: job.roleType || 'Not specified',
+              url: job.url,
               postedDate: validPostedDate,
               foundDate: serverTimestamp(),
               description: job.description || ''
             });
-            existingDocsByTitle.set(normalizedTitle, true);
+            existingDocsByIdentity.set(identity, true);
             newJobsCount++;
           } else {
             // Existing position is verified active & refreshed
-            const existingDocObj = existingDocsByTitle.get(normalizedTitle);
+            const existingDocObj = existingDocsByIdentity.get(identity);
             if (existingDocObj && existingDocObj.id) {
               await setDoc(doc(db, 'jobPostings', existingDocObj.id), {
                 foundDate: serverTimestamp(),
@@ -536,6 +583,8 @@ export default function App() {
         setScanSuccessMsg(`Scan complete for ${employer.name}: Added ${newJobsCount} newly discovered job posting(s).`);
       } else if (refreshedJobsCount > 0) {
         setScanSuccessMsg(`Scan complete for ${employer.name}: All ${refreshedJobsCount} existing position(s) are active and verified up to date.`);
+      } else if (scanWarning) {
+        setScanSuccessMsg(`Scan completed for ${employer.name}: 0 verified active listings found. ${scanWarning}`);
       } else {
         setScanSuccessMsg(`Scan completed for ${employer.name}: 0 active listings found at this time.`);
       }
@@ -765,7 +814,7 @@ export default function App() {
               <CheckCircle2 className="w-6 h-6 text-emerald-600" />
             </div>
             <div>
-              <p className="text-sm text-slate-500 font-medium">Active Postings</p>
+              <p className="text-sm text-slate-500 font-medium">Loaded Postings{hasMoreJobs ? ' (more available)' : ''}</p>
               <p className="text-2xl font-bold text-slate-900">{jobs.length}</p>
             </div>
           </div>
@@ -813,7 +862,7 @@ export default function App() {
                     disabled={isScanning}
                     title={`Scan only employers in ${selectedCategory} (fast & quota-safe)`}
                     className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
-                      isScanning 
+                      isScanning
                         ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                         : 'bg-amber-500 hover:bg-amber-600 text-white shadow-amber-200'
                     }`}
@@ -828,7 +877,7 @@ export default function App() {
                   disabled={isScanning}
                   title="Scan partners not scanned in the last 24 hours (fastest & free-tier friendly)"
                   className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all shadow-md text-sm cursor-pointer ${
-                    isScanning 
+                    isScanning
                       ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
                       : 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-200'
                   }`}
@@ -841,7 +890,7 @@ export default function App() {
                   disabled={isScanning}
                   title="Force re-scan of all 44 employer partners with safe free-tier rate-pacing"
                   className={`flex items-center gap-2 px-4 py-3 font-semibold rounded-xl transition-all border text-sm cursor-pointer ${
-                    isScanning 
+                    isScanning
                       ? 'border-slate-200 text-slate-300 cursor-not-allowed bg-slate-50' 
                       : 'border-slate-200 hover:bg-slate-50 text-slate-700 bg-white'
                   }`}
@@ -850,6 +899,16 @@ export default function App() {
                 </button>
               </div>
             </div>
+
+            {apiConfigured === false && (
+              <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 text-amber-800 text-xs shadow-sm">
+                <KeyRound className="w-4 h-4 flex-shrink-0" />
+                <div>
+                  <span className="font-bold uppercase tracking-wider block mb-0.5">Gemini extraction is not configured</span>
+                  Official ATS scans can still run. Other employers require <code className="font-mono font-bold">GEMINI_API_KEY</code> in the server environment.
+                </div>
+              </div>
+            )}
 
             {scanError && (
               <div className="mt-2 p-3 bg-red-50 border border-red-200 rounded-xl flex items-center gap-3 text-red-700 text-xs shadow-sm">
@@ -1047,7 +1106,7 @@ export default function App() {
                 <h3 className="text-lg font-semibold text-slate-900">No matching jobs found</h3>
                 <p className="text-slate-500 max-w-sm mx-auto mt-1 mb-4 text-sm">
                   {jobs.length > 0 
-                    ? `There are ${jobs.length} total active postings in the database, but none match the current filter criteria.` 
+                    ? `None of the ${jobs.length} loaded postings match your filters.${hasMoreJobs ? ' Older postings may still match; load more below.' : ''}`
                     : "No job postings in the database yet. Click 'Scan Outdated' or 'Scan All' above to discover current openings."}
                 </p>
                 {(searchTerm || selectedCategory !== 'All' || selectedRoleType !== 'All' || selectedCity !== 'All' || selectedTimeframe !== 'all') && (
@@ -1138,6 +1197,15 @@ export default function App() {
                   </motion.div>
                 ))}
               </div>
+            )}
+            {hasMoreJobs && (
+              <button
+                onClick={loadMoreJobs}
+                disabled={loadingMoreJobs}
+                className="mx-auto px-5 py-2.5 bg-blue-50 text-blue-700 hover:bg-blue-100 font-semibold text-sm rounded-xl disabled:opacity-50"
+              >
+                {loadingMoreJobs ? 'Loading older postings...' : 'Load more postings (up to 250)'}
+              </button>
             )}
           </div>
         ) : (
