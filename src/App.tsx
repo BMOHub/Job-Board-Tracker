@@ -79,6 +79,63 @@ interface JobPosting {
 const jobIdentity = (title: string, location?: string) =>
   `${title.trim().toLowerCase()}|${(location || '').trim().toLowerCase()}`;
 
+export const normalizeJobUrl = (url?: string): string => {
+  if (!url) return '';
+  const trimmed = url.trim();
+  if (trimmed.includes('accustaffing.com') && trimmed.includes('postid=')) {
+    try {
+      const parsed = new URL(trimmed);
+      const postid = parsed.searchParams.get('postid');
+      if (postid) {
+        return `https://sprightly-treacle-a70a4f.netlify.app/job.html?id=${encodeURIComponent(postid)}`;
+      }
+    } catch {
+      const match = trimmed.match(/postid=([^&]+)/);
+      if (match) {
+        return `https://sprightly-treacle-a70a4f.netlify.app/job.html?id=${encodeURIComponent(match[1])}`;
+      }
+    }
+  }
+  return trimmed;
+};
+
+const getJobTime = (dateValue: any): number | null => {
+  if (!dateValue) return null;
+  if (typeof dateValue.toMillis === 'function') {
+    const ms = dateValue.toMillis();
+    return isNaN(ms) ? null : ms;
+  }
+  if (typeof dateValue.getTime === 'function') {
+    const ms = dateValue.getTime();
+    return isNaN(ms) ? null : ms;
+  }
+  if (typeof dateValue.toDate === 'function') {
+    const d = dateValue.toDate();
+    return d instanceof Date && !isNaN(d.getTime()) ? d.getTime() : null;
+  }
+  if (typeof dateValue === 'string' || typeof dateValue === 'number') {
+    const d = new Date(dateValue).getTime();
+    return isNaN(d) ? null : d;
+  }
+  return null;
+};
+
+const formatJobDate = (dateValue: any): string | null => {
+  if (!dateValue) return null;
+  if (typeof dateValue.toDate === 'function') {
+    const d = dateValue.toDate();
+    return d instanceof Date && !isNaN(d.getTime()) ? d.toLocaleDateString() : null;
+  }
+  if (dateValue instanceof Date) {
+    return isNaN(dateValue.getTime()) ? null : dateValue.toLocaleDateString();
+  }
+  if (typeof dateValue === 'string' || typeof dateValue === 'number') {
+    const d = new Date(dateValue);
+    return isNaN(d.getTime()) ? null : d.toLocaleDateString();
+  }
+  return null;
+};
+
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [employers, setEmployers] = useState<Employer[]>([]);
@@ -95,7 +152,7 @@ export default function App() {
   const [selectedRoleType, setSelectedRoleType] = useState('All');
   const [selectedCity, setSelectedCity] = useState('All');
   const [selectedTimeframe, setSelectedTimeframe] = useState<'7d' | '14d' | '30d' | 'all'>('all');
-  const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'employer' | 'title'>('newest');
+  const [sortBy, setSortBy] = useState<'posted-desc' | 'posted-asc' | 'newest' | 'oldest' | 'employer' | 'title'>('posted-desc');
   const [activeTab, setActiveTab] = useState<'jobs' | 'employers'>('jobs');
   const [isScanning, setIsScanning] = useState(false);
   const [fatalError, setFatalError] = useState<string | null>(null);
@@ -199,7 +256,10 @@ export default function App() {
 
     const qJobs = query(collection(db, 'jobPostings'), orderBy('foundDate', 'desc'), limit(250));
     const unsubscribeJobs = onSnapshot(qJobs, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as JobPosting));
+      const data = snapshot.docs.map(doc => {
+        const d = doc.data();
+        return { id: doc.id, ...d, url: normalizeJobUrl(d.url) } as JobPosting;
+      });
       setRecentJobs(data);
       // Live refreshes can reorder jobs, so discard stale older pages and reset their cursor.
       setOlderJobs([]);
@@ -224,7 +284,10 @@ export default function App() {
         orderBy('foundDate', 'desc'), startAfter(cursor), limit(250)));
       if (olderCursorRef.current !== cursor) return; // A live refresh invalidated this page.
       setOlderJobs(previous => [...previous,
-        ...page.docs.map(doc => ({ id: doc.id, ...doc.data() } as JobPosting))]);
+        ...page.docs.map(doc => {
+          const d = doc.data();
+          return { id: doc.id, ...d, url: normalizeJobUrl(d.url) } as JobPosting;
+        })]);
       olderCursorRef.current = page.docs.at(-1) || null;
       setHasMoreJobs(page.docs.length === 250);
     } catch (error) {
@@ -620,8 +683,10 @@ export default function App() {
     let result = jobs.filter(job => {
       // Timeframe cutoff enforcement if not 'all'
       if (cutoff > 0) {
-        const foundTime = job.foundDate?.toMillis?.() || job.foundDate?.getTime?.() || 0;
-        if (foundTime && foundTime < cutoff) return false;
+        const postedTime = getJobTime(job.postedDate);
+        const foundTime = getJobTime(job.foundDate) || 0;
+        const relevantTime = postedTime || foundTime;
+        if (relevantTime && relevantTime < cutoff) return false;
       }
 
       const matchesSearch = job.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
@@ -635,11 +700,25 @@ export default function App() {
     });
 
     return result.sort((a, b) => {
-      const timeA = a.foundDate?.toMillis?.() || a.foundDate?.getTime?.() || 0;
-      const timeB = b.foundDate?.toMillis?.() || b.foundDate?.getTime?.() || 0;
+      const postedA = getJobTime(a.postedDate);
+      const postedB = getJobTime(b.postedDate);
+      const foundA = getJobTime(a.foundDate) || 0;
+      const foundB = getJobTime(b.foundDate) || 0;
 
-      if (sortBy === 'newest') return timeB - timeA;
-      if (sortBy === 'oldest') return timeA - timeB;
+      if (sortBy === 'posted-desc') {
+        const effA = postedA ?? foundA;
+        const effB = postedB ?? foundB;
+        if (effB !== effA) return effB - effA;
+        return (a.title || '').localeCompare(b.title || '');
+      }
+      if (sortBy === 'posted-asc') {
+        const effA = postedA ?? foundA;
+        const effB = postedB ?? foundB;
+        if (effA !== effB) return effA - effB;
+        return (a.title || '').localeCompare(b.title || '');
+      }
+      if (sortBy === 'newest') return foundB - foundA;
+      if (sortBy === 'oldest') return foundA - foundB;
       if (sortBy === 'employer') return (a.employerName || '').localeCompare(b.employerName || '');
       if (sortBy === 'title') return (a.title || '').localeCompare(b.title || '');
       return 0;
@@ -651,7 +730,7 @@ export default function App() {
   const cities: string[] = ['All', ...Array.from(new Set<string>(jobs.map(j => j.city).filter((c): c is string => Boolean(c))))];
 
   const exportToCSV = () => {
-    const headers = ['Employer', 'Category', 'Job Title', 'Role Type', 'City', 'Location', 'URL', 'Found Date'];
+    const headers = ['Employer', 'Category', 'Job Title', 'Role Type', 'City', 'Location', 'URL', 'Posted Date', 'Found Date'];
     const rows = filteredJobs.map(job => {
       const employer = employers.find(e => e.id === job.employerId);
       return [
@@ -661,8 +740,9 @@ export default function App() {
         `"${job.roleType || 'N/A'}"`,
         `"${job.city || 'N/A'}"`,
         `"${job.location || 'N/A'}"`,
-        `"${job.url}"`,
-        `"${job.foundDate?.toDate ? job.foundDate.toDate().toLocaleString() : 'N/A'}"`
+        `"${normalizeJobUrl(job.url)}"`,
+        `"${formatJobDate(job.postedDate) || 'N/A'}"`,
+        `"${formatJobDate(job.foundDate) || (job.foundDate?.toDate ? job.foundDate.toDate().toLocaleString() : 'N/A')}"`
       ];
     });
 
@@ -1022,8 +1102,10 @@ export default function App() {
                 onChange={(e) => setSortBy(e.target.value as any)}
                 className="px-4 py-2 bg-slate-50 border-none rounded-lg focus:ring-2 focus:ring-blue-500 transition-all text-sm text-slate-700 font-medium cursor-pointer"
               >
-                <option value="newest">Newest First</option>
-                <option value="oldest">Oldest First</option>
+                <option value="posted-desc">Date Posted: Newest First</option>
+                <option value="posted-asc">Date Posted: Oldest First</option>
+                <option value="newest">Date Found: Newest First</option>
+                <option value="oldest">Date Found: Oldest First</option>
                 <option value="employer">Employer A-Z</option>
                 <option value="title">Job Title A-Z</option>
               </select>
@@ -1145,9 +1227,15 @@ export default function App() {
                               {job.roleType}
                             </span>
                           )}
-                          <span className="text-xs text-slate-400 font-medium flex items-center gap-1">
-                            <Calendar className="w-3 h-3" />
-                            Found {job.foundDate?.toDate ? job.foundDate.toDate().toLocaleDateString() : 'Recently'}
+                          {formatJobDate(job.postedDate) && (
+                            <span className="text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200/60 px-2 py-0.5 rounded flex items-center gap-1" title="Original date posted by employer">
+                              <Calendar className="w-3 h-3 text-blue-500" />
+                              Posted {formatJobDate(job.postedDate)}
+                            </span>
+                          )}
+                          <span className="text-xs text-slate-400 font-medium flex items-center gap-1" title="Date verified by automated scanner">
+                            <Clock className="w-3 h-3 text-slate-400" />
+                            Found {formatJobDate(job.foundDate) || 'Recently'}
                           </span>
                         </div>
                         <h3 className="text-lg font-bold text-slate-900 group-hover:text-blue-600 transition-colors">
@@ -1173,7 +1261,7 @@ export default function App() {
                       </div>
                       <div className="flex flex-col sm:flex-row md:flex-col lg:flex-row items-stretch sm:items-center md:items-stretch lg:items-center gap-2 self-stretch md:self-start">
                         <a
-                          href={job.url}
+                          href={normalizeJobUrl(job.url)}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm rounded-xl transition-all shadow-sm shadow-blue-200 whitespace-nowrap"

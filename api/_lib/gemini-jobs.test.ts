@@ -15,6 +15,9 @@ import {
   parseTaleoJobs,
   parseUkgJobs,
   parseWorkdayJobs,
+  parseRelativeDate,
+  parseDevereuxSitemap,
+  parseAsianBankJobs,
   requestGeminiWithRetry,
   scanJobsForEmployer,
   type SourceDocument,
@@ -666,3 +669,65 @@ test("maps official UKG opportunities without including other casino cities or f
     postedDate: "2026-09-22T18:41:02.312Z", description: "Guest service",
   });
 });
+
+test("parses relative and natural post date strings into valid timestamps", () => {
+  assert.equal(parseRelativeDate(""), "");
+  assert.ok(parseRelativeDate("Posted Today").length > 0);
+  assert.ok(parseRelativeDate("Posted Yesterday").length > 0);
+  assert.ok(parseRelativeDate("Posted 3 days ago").length > 0);
+  assert.ok(parseRelativeDate("Posted 2 weeks ago").length > 0);
+  assert.ok(parseRelativeDate("Posted 30+ days ago").length > 0);
+  assert.equal(new Date(parseRelativeDate("Posted 2 days ago")).toString() !== "Invalid Date", true);
+  assert.equal(parseRelativeDate("2026-09-20T10:00:00Z"), "2026-09-20T10:00:00.000Z");
+});
+
+test("parses Devereux official sitemap into regional postings", () => {
+  const xml = `
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url>
+        <loc>https://jobs.devereux.org/malvern-pa/licensed-outpatient-therapist/24EA951D185A4B1FB3360E0DA9BBE6D9/job/</loc>
+        <lastmod>2026-09-27</lastmod>
+      </url>
+      <url>
+        <loc>https://jobs.devereux.org/austin-tx/remote-therapist/99999999999999999999999999999999/job/</loc>
+        <lastmod>2026-09-25</lastmod>
+      </url>
+      <url>
+        <loc>https://jobs.devereux.org/villanova-pa/bcba-school-based/F8E23E6921F447BAA4C0083BBCF29D9E/job/</loc>
+        <lastmod>2026-09-28</lastmod>
+      </url>
+    </urlset>
+  `;
+  const jobs = parseDevereuxSitemap(xml);
+  assert.equal(jobs.length, 2);
+  assert.equal(jobs[0].title, "Licensed Outpatient Therapist");
+  assert.equal(jobs[0].location, "Malvern, PA");
+  assert.equal(jobs[0].url, "https://jobs.devereux.org/malvern-pa/licensed-outpatient-therapist/24EA951D185A4B1FB3360E0DA9BBE6D9/job/");
+  assert.equal(jobs[1].title, "BCBA School Based");
+  assert.equal(jobs[1].location, "Villanova, PA");
+});
+
+test("verifies Asian Bank careers content without failing on empty active listings", () => {
+  const emptyText = `
+    # About Us
+    Asian Bank is committed to the community.
+    ##### Our current openings
+    * * *
+    ##### [Chinatown Branch Open](https://www.theasianbank.com/about-us/#Chinatown-Branch)
+    111 N. 9th Street
+  `;
+  assert.equal(parseAsianBankJobs(emptyText).length, 0);
+
+  const activeText = `
+    # About Us
+    ##### Our current openings
+    * * *
+    * [Bilingual Teller](https://www.theasianbank.com/careers/teller-apply)
+    ##### [Chinatown Branch Open](https://www.theasianbank.com/about-us/#Chinatown-Branch)
+  `;
+  const jobs = parseAsianBankJobs(activeText);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].title, "Bilingual Teller");
+});
+
+
